@@ -1,0 +1,20 @@
+# Dart/Flutter tooling
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+doc/api/
+
+# Published as a path package — the lockfile belongs to the host app
+pubspec.lock
+
+# Android
+android/.gradle/
+android/local.properties
+android/.idea/
+*.iml
+
+# Misc
+.DS_Store
+.idea/

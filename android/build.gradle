@@ -1,0 +1,56 @@
+group 'com.fuli.messaging_ingest'
+version '1.0-SNAPSHOT'
+
+buildscript {
+    ext.kotlin_version = '1.9.10'
+    repositories {
+        mavenLocal()
+        google()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.3.2'
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+    }
+}
+
+allprojects {
+    repositories {
+        mavenLocal()
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+android {
+    compileSdk 35
+    namespace 'com.fuli.messaging_ingest'
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    sourceSets {
+        main.java.srcDirs += 'src/main/kotlin'
+    }
+
+    defaultConfig {
+        minSdk 23
+    }
+}
+
+dependencies {
+    // NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification
+    // is the whole reason this plugin works. It is androidx-only — the
+    // framework Notification.MessagingStyle has no equivalent extractor.
+    implementation 'androidx.core:core-ktx:1.13.1'
+}

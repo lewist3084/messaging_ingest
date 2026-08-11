@@ -1,0 +1,26 @@
+name: messaging_ingest
+description: >
+  Android notification-based message ingest. Reads MessagingStyle notifications
+  (Google Messages RCS + SMS, WhatsApp, Signal, Telegram) so an app can capture
+  conversations it has no protocol-level access to.
+version: 1.0.0
+publish_to: none
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+  flutter: ">=3.10.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: com.fuli.messaging_ingest
+        pluginClass: MessagingIngestPlugin

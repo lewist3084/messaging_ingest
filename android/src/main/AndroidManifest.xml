@@ -1,0 +1,18 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!-- Bound by the system, not by us. The user grants access manually in
+             Settings > Notifications > Device & app notifications; there is no
+             runtime-permission dialog for this. Once granted, the system starts
+             the service and keeps it bound across app kills and reboots. -->
+        <service
+            android:name=".MessageNotificationListener"
+            android:exported="true"
+            android:label="Message capture"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+    </application>
+</manifest>
