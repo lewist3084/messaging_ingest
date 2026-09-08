@@ -53,4 +53,19 @@ dependencies {
     // is the whole reason this plugin works. It is androidx-only — the
     // framework Notification.MessagingStyle has no equivalent extractor.
     implementation 'androidx.core:core-ktx:1.13.1'
+
+    // The phone writes captured texts to Firestore ITSELF (DeviceTextWriter),
+    // in the process the listener service keeps alive with no Flutter engine.
+    // These artifacts are already in the APK through the flutterfire plugins,
+    // but those declare them `implementation`-scoped to their own modules, so
+    // nothing here compiles against them without an explicit dependency. The
+    // BoM version matches `FirebaseSDKVersion` in firebase_core's
+    // android/gradle.properties (34.17.0 on 2026-09-07); Gradle resolves the
+    // higher of the two if they ever differ.
+    implementation platform('com.google.firebase:firebase-bom:34.17.0')
+    implementation 'com.google.firebase:firebase-firestore'
+    implementation 'com.google.firebase:firebase-auth'
+    // Release builds install Play Integrity before the first request — the
+    // Dart side does the same from BootService, but only when an engine runs.
+    implementation 'com.google.firebase:firebase-appcheck-playintegrity'
 }

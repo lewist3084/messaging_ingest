@@ -34,12 +34,70 @@ class MessageNotificationListener : NotificationListenerService() {
 
         @Volatile
         internal var connected: Boolean = false
+
+        /** What Android substitutes for a redacted sensitive notification,
+         *  as measured on Android 16 in English. A handset in another locale
+         *  posts the same resource translated; add it here once seen. */
+        private val REDACTED_PLACEHOLDERS = setOf(
+            "Sensitive notification content hidden",
+        )
+
+        /**
+         * The live reply box of each conversation whose notification is still
+         * posted: the RemoteInput action Google Messages attached, keyed on
+         * the same conversation key the capture uses. Firing it with text is
+         * how a smartwatch or Android Auto answers a thread, and it is the
+         * ONLY route into an RCS chat any third-party app has. It exists only
+         * while the notification does — reading the thread on the phone
+         * dismisses it, and [onNotificationRemoved] drops the entry.
+         */
+        private val replyTargets =
+            java.util.concurrent.ConcurrentHashMap<String, ReplyTarget>()
+
+        internal fun canReplyInline(conversationKey: String): Boolean =
+            replyTargets.containsKey(conversationKey)
+
+        /**
+         * Answers [conversationKey] through its posted notification. False
+         * when there is no live reply box; throws if the system refused to
+         * fire the action (the intent was cancelled under us).
+         */
+        internal fun replyInline(context: android.content.Context, conversationKey: String, text: String): Boolean {
+            val target = replyTargets[conversationKey] ?: return false
+            val intent = android.content.Intent()
+            val results = android.os.Bundle().apply { putCharSequence(target.remoteInput.resultKey, text) }
+            androidx.core.app.RemoteInput.addResultsToIntent(arrayOf(target.remoteInput), intent, results)
+            val pending = target.action.actionIntent
+                ?: throw IllegalStateException("reply action carries no intent")
+            pending.send(context, 0, intent)
+            return true
+        }
+    }
+
+    internal class ReplyTarget(
+        val sbnKey: String,
+        val action: androidx.core.app.NotificationCompat.Action,
+        val remoteInput: androidx.core.app.RemoteInput,
+    )
+
+    override fun onNotificationRemoved(sbn: StatusBarNotification) {
+        // Keyed on conversation, removed by notification: the two are 1:1 for
+        // Google Messages, and a stale entry would fire a cancelled intent.
+        val gone = replyTargets.entries.filter { it.value.sbnKey == sbn.key }.map { it.key }
+        for (k in gone) replyTargets.remove(k)
     }
 
     override fun onCreate() {
         super.onCreate()
         store = PendingStore(applicationContext)
+        writer = DeviceTextWriter(applicationContext)
+        // The sent side rides on the same always-alive process. Registered
+        // here when READ_SMS is already held, and re-tried on every
+        // notification for the day the grant arrives.
+        SentTextObserver.ensureRegistered(applicationContext)
     }
+
+    private lateinit var writer: DeviceTextWriter
 
     override fun onListenerConnected() {
         super.onListenerConnected()
@@ -62,6 +120,40 @@ class MessageNotificationListener : NotificationListenerService() {
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         runCatching { ingest(sbn) }
+        runCatching { SentTextObserver.ensureRegistered(applicationContext) }
+    }
+
+    /**
+     * Where a fresh capture goes. Since 2026-09-07 the phone writes it to
+     * Firestore itself, on the writer's thread, so the text reaches the
+     * member's computer whether or not the app is running. The pending queue
+     * is the fallback: anything the writer could not place — no config yet,
+     * signed out, offline past the timeout, a switch that says hold — is
+     * queued exactly as before, for the Dart drain the next time the app runs.
+     *
+     * The live Dart sink is invoked ONLY for a queued payload. A payload the
+     * phone already wrote would otherwise be written a second time by the
+     * Dart side — identical documents, so harmless, but a wasted round trip
+     * per text and a second thread transaction racing the first.
+     */
+    private fun deliver(payloads: List<JSONObject>) {
+        if (payloads.isEmpty()) return
+        if (!writer.isConfigured()) {
+            queue(payloads)
+            return
+        }
+        DeviceTextWriter.executor.execute {
+            val outcome = runCatching { writer.writeInbound(payloads) }
+                .getOrElse { DeviceTextWriter.Outcome.DEFER }
+            if (outcome == DeviceTextWriter.Outcome.DEFER) queue(payloads)
+        }
+    }
+
+    private fun queue(payloads: List<JSONObject>) {
+        for (payload in payloads) {
+            store.enqueue(payload)
+            sink?.invoke(payload.toMap())
+        }
     }
 
     private fun ingest(sbn: StatusBarNotification) {
@@ -72,21 +164,46 @@ class MessageNotificationListener : NotificationListenerService() {
         val messages = style.messages
         if (messages.isEmpty()) return
 
+        // Only the phone's texting app. Anything posts a MessagingStyle —
+        // Slack, a Claude prompt and a Life360 alert were all filed as "my
+        // phone" threads before the Dart drain learned to drop them. Dropping
+        // them HERE keeps them out of the dedup ledger and the queue too. The
+        // list is Dart's `kDeviceTextPackages`, pushed down with the config.
+        if (sbn.packageName !in allowedPackages()) return
+
         val conversationKey = conversationKeyFor(sbn, notification, style)
         val isGroup = style.isGroupConversation
         val conversationTitle = style.conversationTitle?.toString()
         val selfName = style.user?.name?.toString()
-        val canReply = hasReplyAction(notification)
+        val reply = replyActionFor(notification)
+        val canReply = reply != null
+        // Keep the live reply box whether or not any message below is new:
+        // a re-post of an already-captured thread still refreshes the intent.
+        if (reply != null) {
+            replyTargets[conversationKey] = ReplyTarget(sbn.key, reply.first, reply.second)
+        }
 
+        val fresh = ArrayList<JSONObject>()
         for (message in messages) {
             val text = message.text?.toString() ?: continue
             if (text.isEmpty()) continue
+            // 🛑 Android 15 redacts a one-time-code text for a listener it does
+            // not trust: the Person is stripped and the text replaced with this
+            // placeholder. Stripped Person + "from me" convention below meant
+            // the OS's own placeholder was filed as a text the MEMBER SENT —
+            // three of them live, in two blank-titled threads, on 2026-09-06.
+            // It is not a message; drop it here.
+            if (text in REDACTED_PLACEHOLDERS) continue
 
             val senderName = message.person?.name?.toString()
             // MessagingStyle convention: a message the user sent carries a null
             // Person. Capturing our own outgoing messages matters — a thread
             // read as inbound-only reads as a monologue and the agent drafting
-            // a reply has no idea what we already said.
+            // a reply has no idea what we already said. In practice this only
+            // ever sees a reply typed into the notification shade: a reply
+            // typed in the messaging app posts no notification at all, which
+            // is why sent texts are read from the SMS store instead
+            // (SentMessageReader).
             val isFromMe = message.person == null ||
                 (selfName != null && senderName == selfName)
 
@@ -119,10 +236,13 @@ class MessageNotificationListener : NotificationListenerService() {
                 put("canReply", canReply)
             }
 
-            store.enqueue(payload)
-            sink?.invoke(payload.toMap())
+            fresh.add(payload)
         }
+        deliver(fresh)
     }
+
+    private fun allowedPackages(): Set<String> =
+        IngestConfig(applicationContext).read()?.packages ?: IngestConfig.DEFAULT_PACKAGES
 
     /**
      * A stable identity for the thread. `shortcutId` is what Google Messages
@@ -143,10 +263,18 @@ class MessageNotificationListener : NotificationListenerService() {
         return sbn.key
     }
 
-    private fun hasReplyAction(notification: Notification): Boolean {
-        val actions = notification.actions ?: return false
-        return actions.any { action ->
-            action.remoteInputs?.any { it.allowFreeFormInput } == true
+    /** The free-form reply action and its input, read through the compat
+     *  layer so the same object can be fired back later. */
+    private fun replyActionFor(
+        notification: Notification,
+    ): Pair<NotificationCompat.Action, androidx.core.app.RemoteInput>? {
+        val count = NotificationCompat.getActionCount(notification)
+        for (i in 0 until count) {
+            val action = NotificationCompat.getAction(notification, i) ?: continue
+            val input = action.remoteInputs?.firstOrNull { it.allowFreeFormInput } ?: continue
+            if (action.actionIntent == null) continue
+            return action to input
         }
+        return null
     }
 }

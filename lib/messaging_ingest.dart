@@ -13,3 +13,4 @@ library messaging_ingest;
 
 export 'src/ingested_message.dart';
 export 'src/messaging_ingest_channel.dart';
+export 'src/sent_message.dart';

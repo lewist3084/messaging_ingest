@@ -1,5 +1,21 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Texts the member SENDS are not in any notification; they are read
+         from the handset's SMS/MMS store (SentMessageReader). Both are
+         runtime permissions, asked at the point of use from the phone's
+         channel page, never at launch. READ_CONTACTS is what turns a number
+         back into the contact name the captured inbound thread is titled
+         with, so the sent text lands in the same conversation.
+         🛑 Google Play restricts READ_SMS to a default SMS handler or an
+         approved use case — an internal distribution is unaffected, a Play
+         listing needs the permission declaration form. -->
+    <uses-permission android:name="android.permission.READ_SMS" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <!-- A reply typed on the member's computer is SENT BY THIS PHONE
+         (SmsSender), the way Phone Link does it. Runtime permission, asked
+         from the same channel page as READ_SMS. -->
+    <uses-permission android:name="android.permission.SEND_SMS" />
+
     <application>
         <!-- Bound by the system, not by us. The user grants access manually in
              Settings > Notifications > Device & app notifications; there is no
