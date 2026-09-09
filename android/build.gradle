@@ -65,6 +65,13 @@ dependencies {
     implementation platform('com.google.firebase:firebase-bom:34.17.0')
     implementation 'com.google.firebase:firebase-firestore'
     implementation 'com.google.firebase:firebase-auth'
+    // A captured picture is copied to Storage as the message is written
+    // (AttachmentUploader) — the bytes live in an MMS part or behind a
+    // notification URI grant, and neither is reachable from the browser the
+    // member reads their threads in. Same reasoning as the two above: the
+    // artifact is already in the APK via the firebase_storage plugin, but
+    // scoped to that module.
+    implementation 'com.google.firebase:firebase-storage'
     // Release builds install Play Integrity before the first request — the
     // Dart side does the same from BootService, but only when an engine runs.
     implementation 'com.google.firebase:firebase-appcheck-playintegrity'

@@ -53,6 +53,21 @@ internal class SentMessageReader(private val context: Context) {
         private const val SELF_TOKEN = "insert-address-token"
 
         private val MMS_PART_URI: Uri = Uri.parse("content://mms/part")
+
+        /**
+         * A file extension for a captured image whose part carried no name.
+         * The chip's label is the only thing the member sees, and "photo-42"
+         * with no extension reads as a file nothing can open.
+         */
+        fun extensionFor(mimeType: String): String = when (mimeType.lowercase()) {
+            "image/jpeg", "image/jpg" -> ".jpg"
+            "image/png" -> ".png"
+            "image/gif" -> ".gif"
+            "image/webp" -> ".webp"
+            "image/heic", "image/heif" -> ".heic"
+            "image/bmp" -> ".bmp"
+            else -> ""
+        }
     }
 
     fun isGranted(): Boolean = held(Manifest.permission.READ_SMS)
@@ -148,8 +163,15 @@ internal class SentMessageReader(private val context: Context) {
             val iDate = c.getColumnIndexOrThrow(Telephony.Mms.DATE)
             while (c.moveToNext()) {
                 val id = c.getLong(iId)
-                val text = mmsText(id) ?: continue
-                if (text.isBlank()) continue
+                // 🛑 A picture message carries no text/plain part at all.
+                // Until 2026-09-08 the `?: continue` here dropped it on the
+                // floor: a photo texted from the handset's own Messages app
+                // reached the thread as NOTHING, and a captioned one as the
+                // caption alone with no sign a picture had gone with it.
+                // Keep the row when either half is present.
+                val text = mmsText(id).orEmpty()
+                val attachments = mmsAttachments(id)
+                if (text.isBlank() && attachments.isEmpty()) continue
                 val recipients = mmsRecipients(id)
                 if (recipients.isEmpty()) continue
                 out.add(
@@ -160,6 +182,7 @@ internal class SentMessageReader(private val context: Context) {
                         addresses = recipients,
                         text = text,
                         timestamp = c.getLong(iDate) * 1000,
+                        attachments = attachments,
                     )
                 )
             }
@@ -207,6 +230,62 @@ internal class SentMessageReader(private val context: Context) {
         return if (parts.isEmpty()) null else parts.joinToString("\n")
     }
 
+    /**
+     * The IMAGE parts of one MMS, as handles the writer can fetch bytes for.
+     *
+     * Images only, deliberately. A picture is what a text message actually
+     * carries; the SMIL layout part is markup, and a vCard or an audio clip
+     * would each need their own rendering before uploading one was worth the
+     * bytes. Everything skipped here is skipped visibly — see the caller.
+     *
+     * The part is NOT read here. A provider read plus a Storage upload per
+     * message, on the thread walking a backlog, is exactly the work that must
+     * not happen during a sync — so this returns the part's content URI and
+     * the upload happens once, at write time, for a message that is actually
+     * new. [MessagingIngestPlugin] exposes the same fetch to the Dart drain.
+     */
+    private fun mmsAttachments(id: Long): List<Map<String, Any?>> {
+        val out = ArrayList<Map<String, Any?>>()
+        context.contentResolver.query(
+            MMS_PART_URI,
+            arrayOf(
+                Telephony.Mms.Part._ID,
+                Telephony.Mms.Part.CONTENT_TYPE,
+                Telephony.Mms.Part.NAME,
+                Telephony.Mms.Part.FILENAME,
+            ),
+            "${Telephony.Mms.Part.MSG_ID} = ?",
+            arrayOf(id.toString()),
+            null,
+        )?.use { c ->
+            val iPart = c.getColumnIndexOrThrow(Telephony.Mms.Part._ID)
+            val iCt = c.getColumnIndexOrThrow(Telephony.Mms.Part.CONTENT_TYPE)
+            val iName = c.getColumnIndexOrThrow(Telephony.Mms.Part.NAME)
+            val iFile = c.getColumnIndexOrThrow(Telephony.Mms.Part.FILENAME)
+            while (c.moveToNext()) {
+                val contentType = c.getString(iCt)?.trim().orEmpty().lowercase()
+                if (!contentType.startsWith("image/")) continue
+                val partId = c.getLong(iPart)
+                // The provider fills one of these, neither, or both, depending
+                // on the sending client. A name the member recognises is nice;
+                // a name at all is required, because it is the chip's label.
+                val named = c.getString(iFile)?.trim().takeUnless { it.isNullOrEmpty() }
+                    ?: c.getString(iName)?.trim().takeUnless { it.isNullOrEmpty() }
+                out.add(
+                    hashMapOf(
+                        "uri" to Uri.withAppendedPath(
+                            MMS_PART_URI,
+                            partId.toString(),
+                        ).toString(),
+                        "mimeType" to contentType,
+                        "fileName" to (named ?: "photo-$partId${extensionFor(contentType)}"),
+                    )
+                )
+            }
+        }
+        return out
+    }
+
     /** TO addresses of one MMS, minus the handset's own placeholder. */
     private fun mmsRecipients(id: Long): List<String> {
         val out = ArrayList<String>()
@@ -235,6 +314,7 @@ internal class SentMessageReader(private val context: Context) {
         addresses: List<String>,
         text: String,
         timestamp: Long,
+        attachments: List<Map<String, Any?>> = emptyList(),
     ): Map<String, Any?> {
         val resolved = ArrayList<String?>(addresses.size)
         for (a in addresses) resolved.add(nameFor(a))
@@ -249,6 +329,7 @@ internal class SentMessageReader(private val context: Context) {
             "names" to resolved,
             "text" to text,
             "timestamp" to timestamp,
+            "attachments" to ArrayList(attachments),
         )
     }
 

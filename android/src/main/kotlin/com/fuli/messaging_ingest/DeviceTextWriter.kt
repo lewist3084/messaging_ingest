@@ -238,6 +238,9 @@ internal class DeviceTextWriter(private val context: Context) {
 
         val batch = s.db.batch()
         val newestPerThread = HashMap<String, JSONObject>()
+        // Preview line per message, keyed on dedup key, so a picture with no
+        // caption advances the thread as "📷 Photo" rather than as blank.
+        val previews = HashMap<String, String>()
         var count = 0
         for (m in payloads) {
             val packageName = m.optString("packageName")
@@ -252,15 +255,36 @@ internal class DeviceTextWriter(private val context: Context) {
             val timestamp = m.optLong("timestamp", 0L)
             val postedAt = m.optLong("postedAt", timestamp)
 
+            val messageDocId = DartDocId.docIdFor(dedupKey)
+            // A picture arrives as a notification data URI beside an empty
+            // text. The grant on it dies with the notification, so it is
+            // copied to Storage HERE — there is no later.
+            val attachmentUri = m.optStringOrNull("attachmentUri").orEmpty()
+            val attachments = if (attachmentUri.isEmpty()) emptyList() else uploadedAttachments(
+                listOf(
+                    mapOf(
+                        "uri" to attachmentUri,
+                        "mimeType" to m.optStringOrNull("attachmentMime").orEmpty(),
+                        "fileName" to "photo-$timestamp" +
+                            SentMessageReader.extensionFor(
+                                m.optStringOrNull("attachmentMime").orEmpty(),
+                            ),
+                    )
+                ),
+                s.company.id,
+                messageDocId,
+            )
+            val text = m.optString("text")
+
             val doc = HashMap<String, Any?>()
-            doc["text"] = m.optString("text")
+            doc["text"] = text
             doc["senderRef"] = if (fromMe) s.memberRef else null
             doc["senderName"] = if (fromMe) s.memberName else (senderName ?: "Unknown")
             // The time it was SENT, not the time it reached Firestore.
             doc["createdAt"] = Timestamp(Date(timestamp))
             doc["readByMemberIds"] = listOf(s.memberRef.id)
             doc["visibleToMemberIds"] = listOf(s.memberRef.id)
-            doc["attachments"] = emptyList<Any>()
+            doc["attachments"] = attachments
             doc["isDeleted"] = false
             doc["source"] = "device"
             doc["capturedAt"] = Timestamp(Date(postedAt))
@@ -269,11 +293,12 @@ internal class DeviceTextWriter(private val context: Context) {
             doc["canReply"] = m.optBoolean("canReply", false)
             doc["ingestedAt"] = FieldValue.serverTimestamp()
             batch.set(
-                threadRef.collection(COL_MESSAGE).document(DartDocId.docIdFor(dedupKey)),
+                threadRef.collection(COL_MESSAGE).document(messageDocId),
                 doc,
                 SetOptions.merge(),
             )
             count++
+            previews[dedupKey] = previewText(text, attachments)
 
             val incumbent = newestPerThread[threadId]
             if (incumbent == null || timestamp > incumbent.optLong("timestamp", 0L)) {
@@ -304,7 +329,7 @@ internal class DeviceTextWriter(private val context: Context) {
                 threadId,
                 title = threadTitle(m),
                 isGroup = m.optBoolean("isGroup", false),
-                text = m.optString("text"),
+                text = previews[m.optString("dedupKey")] ?: m.optString("text"),
                 senderName = if (fromMe) s.memberName else (senderName ?: "Unknown"),
                 atMillis = m.optLong("timestamp", 0L),
                 extra = mapOf(
@@ -358,12 +383,18 @@ internal class DeviceTextWriter(private val context: Context) {
             val idx = index ?: ThreadIndex.load(s).also { index = it }
             val batch = s.db.batch()
             val newestPerThread = HashMap<String, SentRow>()
+            // Preview line per message, so the thread advance below can show
+            // "📷 Photo" for a picture that carried no caption.
+            val previews = HashMap<String, String>()
             var newest = 0L
             var count = 0
             for (raw in rows) {
                 val row = SentRow.from(raw) ?: continue
                 val threadId = idx.resolve(row)
                 val threadRef = s.company.collection(COL_CONVERSATION).document(threadId)
+                val messageDocId = DartDocId.docIdFor(row.dedupKey)
+                val attachments =
+                    uploadedAttachments(row.attachments, s.company.id, messageDocId)
                 val doc = HashMap<String, Any?>()
                 doc["text"] = row.text
                 doc["senderRef"] = s.memberRef
@@ -371,7 +402,7 @@ internal class DeviceTextWriter(private val context: Context) {
                 doc["createdAt"] = Timestamp(Date(row.timestamp))
                 doc["readByMemberIds"] = listOf(s.memberRef.id)
                 doc["visibleToMemberIds"] = listOf(s.memberRef.id)
-                doc["attachments"] = emptyList<Any>()
+                doc["attachments"] = attachments
                 doc["isDeleted"] = false
                 doc["source"] = "device"
                 doc["deviceKind"] = row.kind
@@ -381,11 +412,12 @@ internal class DeviceTextWriter(private val context: Context) {
                 doc["deviceDedupKey"] = row.dedupKey
                 doc["ingestedAt"] = FieldValue.serverTimestamp()
                 batch.set(
-                    threadRef.collection(COL_MESSAGE).document(DartDocId.docIdFor(row.dedupKey)),
+                    threadRef.collection(COL_MESSAGE).document(messageDocId),
                     doc,
                     SetOptions.merge(),
                 )
                 count++
+                previews[row.dedupKey] = previewText(row.text, attachments)
                 val incumbent = newestPerThread[threadId]
                 if (incumbent == null || row.timestamp > incumbent.timestamp) {
                     newestPerThread[threadId] = row
@@ -417,7 +449,7 @@ internal class DeviceTextWriter(private val context: Context) {
                     // named; it only names one it had to create.
                     title = if (idx.isNew(threadId)) sentTitle(row) else null,
                     isGroup = row.addresses.size > 1,
-                    text = row.text,
+                    text = previews[row.dedupKey] ?: row.text,
                     senderName = s.memberName,
                     atMillis = row.timestamp,
                     extra = mapOf(
@@ -455,11 +487,19 @@ internal class DeviceTextWriter(private val context: Context) {
         val names: List<String?>,
         val text: String,
         val timestamp: Long,
+        val attachments: List<Map<String, Any?>>,
     ) {
         companion object {
             @Suppress("UNCHECKED_CAST")
             fun from(m: Map<String, Any?>): SentRow? {
-                val text = (m["text"] as? String)?.takeIf { it.isNotEmpty() } ?: return null
+                val text = (m["text"] as? String).orEmpty()
+                val attachments = (m["attachments"] as? List<*>)
+                    ?.mapNotNull { it as? Map<String, Any?> }
+                    ?: emptyList()
+                // A picture message has no text. Requiring one here was the
+                // second of the three places a photo went missing — see
+                // SentMessageReader.readMms for the first.
+                if (text.isEmpty() && attachments.isEmpty()) return null
                 val dedupKey = (m["dedupKey"] as? String)?.takeIf { it.isNotEmpty() } ?: return null
                 val addresses = (m["addresses"] as? List<*>)?.mapNotNull { it as? String } ?: emptyList()
                 if (addresses.isEmpty()) return null
@@ -474,10 +514,69 @@ internal class DeviceTextWriter(private val context: Context) {
                     names = names,
                     text = text,
                     timestamp = (m["timestamp"] as? Long) ?: 0L,
+                    attachments = attachments,
                 )
             }
         }
     }
+
+    /**
+     * Copies each captured picture to Storage and returns the `attachments`
+     * value for the message document — the shape `TextMessageAttachment`
+     * reads, so a captured photo renders in the bubble exactly like one sent
+     * from the app.
+     *
+     * A picture that cannot be read or uploaded is DROPPED, not deferred. Both
+     * sources are perishable — a notification's URI grant dies with the
+     * notification, and an MMS part can be reclaimed — so retrying forever
+     * would hold the whole message hostage to bytes that are already gone. The
+     * message still lands with its text; [previewText] is what stops a
+     * picture-only one from arriving as a blank bubble.
+     */
+    private fun uploadedAttachments(
+        parts: List<Map<String, Any?>>,
+        companyId: String,
+        messageDocId: String,
+    ): List<Map<String, Any?>> {
+        if (parts.isEmpty()) return emptyList()
+        val uploader = AttachmentUploader(context)
+        val out = ArrayList<Map<String, Any?>>(parts.size)
+        for (part in parts) {
+            val uri = (part["uri"] as? String)?.takeIf { it.isNotEmpty() } ?: continue
+            val mimeType = (part["mimeType"] as? String).orEmpty().ifBlank { "image/jpeg" }
+            val fileName = (part["fileName"] as? String).orEmpty().ifBlank { "photo" }
+            val url = uploader.upload(
+                uri = uri,
+                mimeType = mimeType,
+                fileName = fileName,
+                companyId = companyId,
+                messageDocId = messageDocId,
+            ) ?: continue
+            out.add(
+                hashMapOf(
+                    "url" to url,
+                    "fileName" to fileName,
+                    "mimeType" to mimeType,
+                    // Images only reach here — SentMessageReader and the
+                    // listener both filter on `image/` — so the bubble always
+                    // has something to render inline.
+                    "type" to "image",
+                )
+            )
+        }
+        return out
+    }
+
+    /**
+     * What a thread's preview line says for this message. A picture message
+     * has no text, and a thread whose newest row is blank reads as an empty
+     * conversation in the list — the same silence the picture itself used to
+     * arrive in.
+     */
+    private fun previewText(text: String, attachments: List<Map<String, Any?>>): String =
+        if (text.isNotBlank() || attachments.isEmpty()) text
+        else if (attachments.size == 1) "📷 Photo"
+        else "📷 ${attachments.size} photos"
 
     /** The member's device threads, indexed for filing sent texts. Mirrors
      *  `_DeviceThreadIndex`. */

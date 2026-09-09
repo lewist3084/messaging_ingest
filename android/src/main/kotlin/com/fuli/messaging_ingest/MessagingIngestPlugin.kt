@@ -111,6 +111,28 @@ class MessagingIngestPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 if (until != null) sent.ack(until)
                 result.success(null)
             }
+            // ── A captured picture's bytes, on demand ──
+            // The native writer uploads these itself (AttachmentUploader) and
+            // never calls this. It exists for the DART drain — the fallback
+            // path on a phone whose native writer is not configured — which
+            // otherwise has a content URI it cannot open from Dart.
+            //
+            // Bytes rather than a URI on purpose: the URI is readable only by
+            // this process, under this app's READ_SMS grant or the shade's
+            // grant to the listener, and neither travels.
+            "readAttachmentBytes" -> {
+                val uri = call.argument<String>("uri").orEmpty()
+                if (uri.isEmpty()) {
+                    result.success(null)
+                } else {
+                    // A photo is megabytes; reading it on the channel's
+                    // calling thread would jank whatever frame is in flight.
+                    Thread {
+                        val bytes = AttachmentUploader(context).readBytes(uri)
+                        main.post { result.success(bytes) }
+                    }.start()
+                }
+            }
             // ── Replying FROM this handset (queued on another device) ──
             "canReplyInline" -> {
                 val key = call.argument<String>("conversationKey") ?: ""

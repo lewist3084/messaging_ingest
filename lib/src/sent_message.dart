@@ -10,6 +10,41 @@
 /// contact's display name in the same position of [names]. The captured
 /// inbound thread is titled with exactly those display names, which is what
 /// the consumer matches on to file this in the right conversation.
+/// One picture carried by a sent MMS.
+///
+/// [uri] is a `content://mms/part/<id>` handle readable only inside the app's
+/// own process under READ_SMS — the bytes are fetched with
+/// `MessagingIngest.readAttachmentBytes` and uploaded, because the member
+/// reads their threads in a browser that can reach neither.
+class SentAttachment {
+  const SentAttachment({
+    required this.uri,
+    required this.mimeType,
+    required this.fileName,
+  });
+
+  final String uri;
+
+  /// Always `image/*`: the reader keeps pictures and skips the SMIL layout
+  /// part, vCards and audio, none of which a bubble can render.
+  final String mimeType;
+  final String fileName;
+
+  static SentAttachment? fromMap(Map<dynamic, dynamic> map) {
+    final uri = (map['uri'] as String?)?.trim();
+    if (uri == null || uri.isEmpty) return null;
+    return SentAttachment(
+      uri: uri,
+      mimeType: (map['mimeType'] as String?)?.trim().isNotEmpty == true
+          ? (map['mimeType'] as String).trim()
+          : 'image/jpeg',
+      fileName: (map['fileName'] as String?)?.trim().isNotEmpty == true
+          ? (map['fileName'] as String).trim()
+          : 'photo',
+    );
+  }
+}
+
 class SentMessage {
   const SentMessage({
     required this.dedupKey,
@@ -19,6 +54,7 @@ class SentMessage {
     required this.names,
     required this.text,
     required this.timestamp,
+    this.attachments = const <SentAttachment>[],
   });
 
   /// `sms|<row id>` or `mms|<row id>`. Provider row ids are stable for the
@@ -43,12 +79,24 @@ class SentMessage {
   /// When it was sent, per the provider.
   final DateTime timestamp;
 
+  /// The pictures it carried. An MMS sent from the handset's own Messages app
+  /// is very often a picture and NOTHING else.
+  final List<SentAttachment> attachments;
+
   bool get isGroup => addresses.length > 1;
 
   static SentMessage? fromMap(Map<dynamic, dynamic> map) {
     final text = map['text'] as String?;
     final dedupKey = map['dedupKey'] as String?;
-    if (text == null || text.isEmpty || dedupKey == null) return null;
+    final attachments = ((map['attachments'] as List?) ?? const [])
+        .whereType<Map<dynamic, dynamic>>()
+        .map(SentAttachment.fromMap)
+        .whereType<SentAttachment>()
+        .toList(growable: false);
+    if (dedupKey == null) return null;
+    // 🛑 A picture message has no text/plain part at all. Requiring text here
+    // was the third of three places a sent photo vanished without a trace.
+    if ((text == null || text.isEmpty) && attachments.isEmpty) return null;
     final addresses = (map['addresses'] as List?)
             ?.map((e) => e?.toString() ?? '')
             .where((e) => e.isNotEmpty)
@@ -68,8 +116,9 @@ class SentMessage {
       threadId: (map['threadId'] ?? '').toString(),
       addresses: addresses,
       names: names,
-      text: text,
+      text: text ?? '',
       timestamp: DateTime.fromMillisecondsSinceEpoch(ms is int ? ms : 0),
+      attachments: attachments,
     );
   }
 }

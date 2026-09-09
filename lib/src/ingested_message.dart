@@ -18,6 +18,8 @@ class IngestedMessage {
     required this.timestamp,
     required this.postedAt,
     required this.canReply,
+    this.attachmentUri,
+    this.attachmentMimeType,
   });
 
   /// Stable identity for this message. Notifications re-post their whole recent
@@ -57,11 +59,34 @@ class IngestedMessage {
   /// staleness rate is measurable before any reply path is built on it.
   final bool canReply;
 
+  /// A `content://` URI for the picture this message carried, when it carried
+  /// one. Readable ONLY inside the app's own process, and only while the
+  /// notification that granted it is posted — so it is a handle to copy from
+  /// promptly, never something to store. Fetch the bytes with
+  /// `MessagingIngest.readAttachmentBytes`.
+  final String? attachmentUri;
+
+  /// Always an `image/*` type: the capture side drops every other kind,
+  /// because a bubble has nothing to render them with.
+  final String? attachmentMimeType;
+
+  /// A picture message has no text at all. Anything reading these must say
+  /// what it shows for one — see the thread preview in `MessageIngestService`.
+  bool get hasAttachment => (attachmentUri?.isNotEmpty ?? false);
+
   static IngestedMessage? fromMap(Map<dynamic, dynamic> map) {
     final text = map['text'] as String?;
     final dedupKey = map['dedupKey'] as String?;
-    if (text == null || text.isEmpty || dedupKey == null) return null;
+    final attachmentUri = (map['attachmentUri'] as String?)?.trim();
+    final hasAttachment = attachmentUri != null && attachmentUri.isNotEmpty;
+    // 🛑 Empty text is a PICTURE, not a blank. Rejecting it here was one of
+    // three places an incoming photo was dropped without trace.
+    if (dedupKey == null) return null;
+    if ((text == null || text.isEmpty) && !hasAttachment) return null;
     return IngestedMessage(
+      attachmentUri: hasAttachment ? attachmentUri : null,
+      attachmentMimeType:
+          hasAttachment ? (map['attachmentMime'] as String?) : null,
       dedupKey: dedupKey,
       packageName: (map['packageName'] as String?) ?? '',
       conversationKey: (map['conversationKey'] as String?) ?? '',
@@ -69,7 +94,7 @@ class IngestedMessage {
       isGroup: (map['isGroup'] as bool?) ?? false,
       senderName: map['senderName'] as String?,
       isFromMe: (map['isFromMe'] as bool?) ?? false,
-      text: text,
+      text: text ?? '',
       timestamp: _millis(map['timestamp']),
       postedAt: _millis(map['postedAt']),
       canReply: (map['canReply'] as bool?) ?? false,
@@ -90,6 +115,8 @@ class IngestedMessage {
         'senderName': senderName,
         'isFromMe': isFromMe,
         'text': text,
+        'attachmentUri': attachmentUri,
+        'attachmentMime': attachmentMimeType,
         'timestamp': timestamp.toIso8601String(),
         'postedAt': postedAt.toIso8601String(),
         'canReply': canReply,

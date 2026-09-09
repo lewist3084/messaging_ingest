@@ -185,8 +185,15 @@ class MessageNotificationListener : NotificationListenerService() {
 
         val fresh = ArrayList<JSONObject>()
         for (message in messages) {
-            val text = message.text?.toString() ?: continue
-            if (text.isEmpty()) continue
+            val text = message.text?.toString().orEmpty()
+            // A picture message posts a notification with an EMPTY text and a
+            // data URI beside it — which the `?: continue` here used to drop
+            // whole, so an incoming photo simply never arrived. Images only:
+            // anything else the shade can carry has no bubble to render it in.
+            val dataUri = message.dataUri
+            val dataMime = message.dataMimeType?.trim().orEmpty().lowercase()
+            val imageUri = if (dataMime.startsWith("image/")) dataUri else null
+            if (text.isEmpty() && imageUri == null) continue
             // 🛑 Android 15 redacts a one-time-code text for a listener it does
             // not trust: the Person is stripped and the text replaced with this
             // placeholder. Stripped Person + "from me" convention below meant
@@ -207,13 +214,22 @@ class MessageNotificationListener : NotificationListenerService() {
             val isFromMe = message.person == null ||
                 (selfName != null && senderName == selfName)
 
-            val dedupKey = listOf(
-                sbn.packageName,
-                conversationKey,
-                message.timestamp.toString(),
-                senderName ?: "self",
-                text.hashCode().toString(),
-            ).joinToString("|")
+            val dedupKey = buildList {
+                add(sbn.packageName)
+                add(conversationKey)
+                add(message.timestamp.toString())
+                add(senderName ?: "self")
+                add(text.hashCode().toString())
+                // 🛑 APPENDED ONLY WHEN THERE IS AN IMAGE. This key is the
+                // Firestore document id (`DartDocId.docIdFor`) and the local
+                // seen-ledger's key, so adding a segment unconditionally would
+                // re-key every text already captured — every one of them would
+                // come back as a NEW document on the next re-post, and the
+                // member's threads would double. Two pictures sent in the same
+                // second under one caption do need separating, so the segment
+                // exists; it just cannot exist for a plain text.
+                if (imageUri != null) add(imageUri.toString().hashCode().toString())
+            }.joinToString("|")
 
             if (store.hasSeen(dedupKey)) continue
             store.markSeen(dedupKey)
@@ -227,6 +243,12 @@ class MessageNotificationListener : NotificationListenerService() {
                 put("senderName", senderName ?: JSONObject.NULL)
                 put("isFromMe", isFromMe)
                 put("text", text)
+                // The picture, when there is one. A content URI the shade
+                // granted US read on — it is not readable by any other
+                // process and it does not survive the notification, so the
+                // writer uploads it on the way past rather than storing it.
+                put("attachmentUri", imageUri?.toString() ?: JSONObject.NULL)
+                put("attachmentMime", if (imageUri != null) dataMime else JSONObject.NULL)
                 put("timestamp", message.timestamp)
                 put("postedAt", sbn.postTime)
                 // Whether a RemoteInput reply action was still attached when we

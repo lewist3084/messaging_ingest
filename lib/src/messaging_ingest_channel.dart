@@ -184,6 +184,29 @@ class MessagingIngest {
         .toList(growable: false);
   }
 
+  /// The bytes behind a captured picture's `content://` URI, or null when it
+  /// cannot be read.
+  ///
+  /// Both sources are perishable and process-local: an MMS part is readable
+  /// only under this app's READ_SMS grant, and a notification's data URI only
+  /// while the notification is posted. So this is a copy-it-now handle, not a
+  /// reference to keep — call it on the way to a Storage upload.
+  ///
+  /// Returns null past a size cap (12 MB) rather than a truncated image, and
+  /// null for a part the provider has already reclaimed. The caller writes the
+  /// message without the picture rather than losing the message.
+  ///
+  /// Note the phone's own writer never calls this: it uploads natively, so a
+  /// picture arrives while the app is closed. This is the fallback drain's
+  /// path.
+  Future<Uint8List?> readAttachmentBytes(String uri) async {
+    if (!isSupported || uri.trim().isEmpty) return null;
+    return _methods.invokeMethod<Uint8List>(
+      'readAttachmentBytes',
+      {'uri': uri},
+    );
+  }
+
   /// Marks everything up to [until] as handed over. Call after the write
   /// that used it has committed, never before.
   Future<void> ackSent(DateTime until) async {
