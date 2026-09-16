@@ -33,6 +33,9 @@ import androidx.core.content.ContextCompat
  * Reads are non-destructive; the caller advances [watermark] via [ack] only
  * after its own write has committed, so an interrupted sync re-reads rather
  * than loses.
+ *
+ * Also reads ONE conversation's past — both directions — for the history
+ * pull ([readThread], [threadIdFor]). Nothing here reads the whole store.
  */
 internal class SentMessageReader(private val context: Context) {
 
@@ -48,6 +51,9 @@ internal class SentMessageReader(private val context: Context) {
 
         /** PduHeaders.TO — the recipients of an outgoing MMS. */
         private const val MMS_ADDR_TO = 151
+
+        /** PduHeaders.FROM — the sender of an incoming MMS. */
+        private const val MMS_ADDR_FROM = 137
 
         /** The provider's placeholder for "this handset" in an MMS addr row. */
         private const val SELF_TOKEN = "insert-address-token"
@@ -306,6 +312,191 @@ internal class SentMessageReader(private val context: Context) {
         }
         return out
     }
+
+    // ── One conversation's history ──────────────────────────────────────────
+
+    /**
+     * One handset conversation's SMS and MMS, BOTH directions, older than
+     * [beforeMillis]: the newest [limit] of them, returned oldest first. Each
+     * row is the [read] shape plus `outgoing` and, for an incoming one,
+     * `sender` / `senderName`. Dedup keys are the provider row ids [read] uses,
+     * so a sent text seen by both paths is the same document.
+     */
+    fun readThread(threadId: Long, beforeMillis: Long, limit: Int): List<Map<String, Any?>> {
+        if (!isGranted()) return emptyList()
+        val out = ArrayList<Map<String, Any?>>()
+        runCatching { readThreadSms(threadId, beforeMillis, limit, out) }
+        runCatching { readThreadMms(threadId, beforeMillis, limit, out) }
+        out.sortByDescending { it["timestamp"] as Long }
+        val newest = ArrayList(if (out.size > limit) out.subList(0, limit) else out)
+        newest.sortBy { it["timestamp"] as Long }
+        return newest
+    }
+
+    /**
+     * The handset conversation [number] texts in, found among messages the
+     * phone already stores — never created (`Threads.getOrCreateThreadId`
+     * would add an empty thread to the member's Messages). Matched on the
+     * last ten digits, however the provider spelled the address. Null when
+     * there is no SMS with that number at all.
+     */
+    fun threadIdFor(number: String): String? {
+        if (!isGranted()) return null
+        val digits = number.filter { it.isDigit() }
+        if (digits.length < 7) return null
+        val last10 = if (digits.length > 10) digits.takeLast(10) else digits
+        context.contentResolver.query(
+            Telephony.Sms.CONTENT_URI,
+            arrayOf(Telephony.Sms.THREAD_ID, Telephony.Sms.ADDRESS),
+            "${Telephony.Sms.ADDRESS} LIKE ?",
+            arrayOf("%" + digits.takeLast(4)),
+            "${Telephony.Sms.DATE} DESC LIMIT 50",
+        )?.use { c ->
+            while (c.moveToNext()) {
+                val d = c.getString(1)?.filter { it.isDigit() }.orEmpty()
+                val tail = if (d.length > 10) d.takeLast(10) else d
+                if (tail == last10) return c.getLong(0).toString()
+            }
+        }
+        return null
+    }
+
+    private fun readThreadSms(
+        threadId: Long,
+        beforeMillis: Long,
+        limit: Int,
+        out: MutableList<Map<String, Any?>>,
+    ) {
+        context.contentResolver.query(
+            Telephony.Sms.CONTENT_URI,
+            arrayOf(
+                Telephony.Sms._ID,
+                Telephony.Sms.ADDRESS,
+                Telephony.Sms.BODY,
+                Telephony.Sms.DATE,
+                Telephony.Sms.TYPE,
+            ),
+            "${Telephony.Sms.THREAD_ID} = ? AND ${Telephony.Sms.DATE} < ? AND " +
+                "${Telephony.Sms.TYPE} IN (?, ?)",
+            arrayOf(
+                threadId.toString(),
+                beforeMillis.toString(),
+                Telephony.Sms.MESSAGE_TYPE_INBOX.toString(),
+                Telephony.Sms.MESSAGE_TYPE_SENT.toString(),
+            ),
+            "${Telephony.Sms.DATE} DESC LIMIT $limit",
+        )?.use { c ->
+            val iId = c.getColumnIndexOrThrow(Telephony.Sms._ID)
+            val iAddr = c.getColumnIndexOrThrow(Telephony.Sms.ADDRESS)
+            val iBody = c.getColumnIndexOrThrow(Telephony.Sms.BODY)
+            val iDate = c.getColumnIndexOrThrow(Telephony.Sms.DATE)
+            val iType = c.getColumnIndexOrThrow(Telephony.Sms.TYPE)
+            while (c.moveToNext()) {
+                val body = c.getString(iBody) ?: continue
+                if (body.isBlank()) continue
+                val address = c.getString(iAddr)?.trim().orEmpty()
+                val outgoing = c.getInt(iType) == Telephony.Sms.MESSAGE_TYPE_SENT
+                out.add(
+                    historyPayload(
+                        kind = "sms",
+                        id = c.getLong(iId),
+                        threadId = threadId,
+                        outgoing = outgoing,
+                        sender = if (outgoing || address.isEmpty()) null else address,
+                        addresses = if (address.isEmpty()) emptyList() else listOf(address),
+                        text = body,
+                        timestamp = c.getLong(iDate),
+                    )
+                )
+            }
+        }
+    }
+
+    private fun readThreadMms(
+        threadId: Long,
+        beforeMillis: Long,
+        limit: Int,
+        out: MutableList<Map<String, Any?>>,
+    ) {
+        // MMS dates are SECONDS — see readMms.
+        context.contentResolver.query(
+            Telephony.Mms.CONTENT_URI,
+            arrayOf(Telephony.Mms._ID, Telephony.Mms.DATE, Telephony.Mms.MESSAGE_BOX),
+            "${Telephony.Mms.THREAD_ID} = ? AND ${Telephony.Mms.DATE} < ? AND " +
+                "${Telephony.Mms.MESSAGE_BOX} IN (?, ?)",
+            arrayOf(
+                threadId.toString(),
+                (beforeMillis / 1000).toString(),
+                Telephony.Mms.MESSAGE_BOX_INBOX.toString(),
+                Telephony.Mms.MESSAGE_BOX_SENT.toString(),
+            ),
+            "${Telephony.Mms.DATE} DESC LIMIT $limit",
+        )?.use { c ->
+            val iId = c.getColumnIndexOrThrow(Telephony.Mms._ID)
+            val iDate = c.getColumnIndexOrThrow(Telephony.Mms.DATE)
+            val iBox = c.getColumnIndexOrThrow(Telephony.Mms.MESSAGE_BOX)
+            while (c.moveToNext()) {
+                val id = c.getLong(iId)
+                val text = mmsText(id).orEmpty()
+                val attachments = mmsAttachments(id)
+                if (text.isBlank() && attachments.isEmpty()) continue
+                val outgoing = c.getInt(iBox) == Telephony.Mms.MESSAGE_BOX_SENT
+                out.add(
+                    historyPayload(
+                        kind = "mms",
+                        id = id,
+                        threadId = threadId,
+                        outgoing = outgoing,
+                        sender = if (outgoing) null else mmsFrom(id),
+                        addresses = if (outgoing) mmsRecipients(id) else emptyList(),
+                        text = text,
+                        timestamp = c.getLong(iDate) * 1000,
+                        attachments = attachments,
+                    )
+                )
+            }
+        }
+    }
+
+    /** The FROM address of one incoming MMS, or null. */
+    private fun mmsFrom(id: Long): String? {
+        context.contentResolver.query(
+            Uri.parse("content://mms/$id/addr"),
+            arrayOf(Telephony.Mms.Addr.ADDRESS),
+            "${Telephony.Mms.Addr.TYPE} = ?",
+            arrayOf(MMS_ADDR_FROM.toString()),
+            null,
+        )?.use { c ->
+            while (c.moveToNext()) {
+                val a = c.getString(0)?.trim().orEmpty()
+                if (a.isNotEmpty() && a != SELF_TOKEN) return a
+            }
+        }
+        return null
+    }
+
+    private fun historyPayload(
+        kind: String,
+        id: Long,
+        threadId: Long,
+        outgoing: Boolean,
+        sender: String?,
+        addresses: List<String>,
+        text: String,
+        timestamp: Long,
+        attachments: List<Map<String, Any?>> = emptyList(),
+    ): Map<String, Any?> = hashMapOf(
+        "dedupKey" to "$kind|$id",
+        "kind" to kind,
+        "threadId" to threadId.toString(),
+        "outgoing" to outgoing,
+        "sender" to sender,
+        "senderName" to sender?.let { nameFor(it) },
+        "addresses" to ArrayList(addresses),
+        "text" to text,
+        "timestamp" to timestamp,
+        "attachments" to ArrayList(attachments),
+    )
 
     private fun payload(
         kind: String,

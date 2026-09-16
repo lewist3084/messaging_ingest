@@ -46,8 +46,10 @@ import java.util.concurrent.TimeoutException
  *
  * - WHO and WHERE: [IngestConfig], pushed down by Dart once the membership is
  *   resolved. Without it, nothing is written.
- * - The switches (`deviceTextCaptureOff`, `deviceCaptureIncoming`,
- *   `deviceCaptureSent`): read FRESH off the member document on every write,
+ * - The settings (`deviceTextCaptureOff` and the Limit list): read FRESH off
+ *   the member document on every write. Incoming and sent texts have no
+ *   switches — both are always written once the phone is set up, and the
+ *   old `deviceCaptureIncoming` / `deviceCaptureSent` fields are ignored —
  *   server first, cache when offline — so a switch flipped on the web takes
  *   effect on the phone without the app ever opening.
  * - App Check: the Dart side installs the provider from `BootService`; with
@@ -89,16 +91,27 @@ internal class DeviceTextWriter(private val context: Context) {
         private const val COL_MESSAGE = "message"
 
         private const val FIELD_CAPTURE_OFF = "deviceTextCaptureOff"
-        private const val FIELD_CAPTURE_INCOMING = "deviceCaptureIncoming"
-        private const val FIELD_CAPTURE_SENT = "deviceCaptureSent"
+        private const val FIELD_INCOMING_LIMIT = "deviceIncomingLimit"
+        private const val FIELD_INCOMING_MODE = "deviceIncomingMode"
+        private const val FIELD_INCOMING_PEOPLE = "deviceIncomingPeople"
 
         /** A batch commit is durable locally as soon as it is enqueued; this
          *  is how long we wait for the SERVER before moving on. */
         private const val WRITE_TIMEOUT_S = 25L
 
         /** Sent-text paging, the same constants as the Dart side. */
-        private const val SENT_BACKFILL_MS = 30L * 24 * 60 * 60 * 1000
         private const val SENT_PAGE_SIZE = 300
+
+        /** Set on a thread once its phone history has been pulled. */
+        private const val FIELD_HISTORY_PULLED_AT = "deviceHistoryPulledAt"
+
+        /** The most of ONE conversation's past a pull files. */
+        private const val HISTORY_LIMIT = 300
+
+        /** A history row must be at least this much older than the text that
+         *  woke the pull, so the notification's own copy of that text is not
+         *  filed a second time from the provider (whose clock differs). */
+        private const val HISTORY_MARGIN_MS = 1000L
         private const val SENT_PAGES_PER_SYNC = 4
 
         @Volatile private var appCheckInstalled = false
@@ -115,8 +128,9 @@ internal class DeviceTextWriter(private val context: Context) {
         val memberName: String,
         val packages: Set<String>,
         val captureOff: Boolean,
-        val captureIncoming: Boolean,
-        val captureSent: Boolean,
+        val incomingLimit: Boolean,
+        val incomingExclude: Boolean,
+        val incomingPeople: List<String>,
     )
 
     /** The outcome of handing a capture to the phone's own writer. */
@@ -164,8 +178,11 @@ internal class DeviceTextWriter(private val context: Context) {
             memberName = name,
             packages = cfg.packages,
             captureOff = data[FIELD_CAPTURE_OFF] == true,
-            captureIncoming = data[FIELD_CAPTURE_INCOMING] != false,
-            captureSent = data[FIELD_CAPTURE_SENT] != false,
+            incomingLimit = data[FIELD_INCOMING_LIMIT] == true,
+            incomingExclude = data[FIELD_INCOMING_MODE] == "exclude",
+            incomingPeople = (data[FIELD_INCOMING_PEOPLE] as? List<*>)
+                ?.filterIsInstance<String>()
+                .orEmpty(),
         )
     }
 
@@ -232,9 +249,6 @@ internal class DeviceTextWriter(private val context: Context) {
         val s = session() ?: return Outcome.DEFER
         // Master off: the Dart side leaves these queued, and so do we.
         if (s.captureOff) return Outcome.DEFER
-        // "Bring in texts that arrive" off: dropped, exactly as the drain
-        // drops them — nothing announced while it is off is filed.
-        if (!s.captureIncoming) return Outcome.HANDLED
 
         val batch = s.db.batch()
         val newestPerThread = HashMap<String, JSONObject>()
@@ -245,6 +259,8 @@ internal class DeviceTextWriter(private val context: Context) {
         for (m in payloads) {
             val packageName = m.optString("packageName")
             if (packageName !in s.packages) continue
+            // Not on the member's "Limit who comes in" list: dropped, final.
+            if (!passesIncomingList(s, m)) continue
             val conversationKey = m.optString("conversationKey")
             val dedupKey = m.optString("dedupKey")
             if (conversationKey.isEmpty() || dedupKey.isEmpty()) continue
@@ -339,6 +355,20 @@ internal class DeviceTextWriter(private val context: Context) {
             )
             if (!ok) allAdvanced = false
         }
+        // A conversation that has just come alive brings its past with it —
+        // once. A group notification names no number to find it by.
+        for ((threadId, m) in newestPerThread) {
+            if (m.optBoolean("isGroup", false)) continue
+            runCatching {
+                pullHistory(
+                    s,
+                    threadId,
+                    handsetThreadId = null,
+                    beforeMillis = m.optLong("timestamp", 0L) - HISTORY_MARGIN_MS,
+                    whoForLookup = threadTitle(m),
+                )
+            }.onFailure { Log.w(TAG, "history pull failed for $threadId: ${it.message}") }
+        }
         return if (allAdvanced) Outcome.HANDLED else Outcome.DEFER
     }
 
@@ -347,6 +377,25 @@ internal class DeviceTextWriter(private val context: Context) {
      * it has one, else the other party. Blank counts as absent, and so does
      * our own name — an outgoing message names nobody.
      */
+    /** Mirrors `MessageIngestService._passesIncomingList` — keep them equal. */
+    private fun passesIncomingList(s: Session, m: JSONObject): Boolean {
+        if (!s.incomingLimit) return true
+        val hit = matchesIncomingList(
+            s.incomingPeople,
+            listOf(threadTitle(m), m.optStringOrNull("senderName")),
+        )
+        return if (s.incomingExclude) !hit else hit
+    }
+
+    /** The same list for a text the member SENT: it belongs to whoever it went
+     *  to, matched on the recipients' contact names and numbers. A group is a
+     *  hit when anyone in it is on the list. Mirrors `_passesSentList` in Dart. */
+    private fun passesSentList(s: Session, row: SentRow): Boolean {
+        if (!s.incomingLimit) return true
+        val hit = matchesIncomingList(s.incomingPeople, row.names + row.addresses)
+        return if (s.incomingExclude) !hit else hit
+    }
+
     private fun threadTitle(m: JSONObject): String? {
         val title = m.optStringOrNull("conversationTitle")?.trim().orEmpty()
         if (title.isNotEmpty()) return title
@@ -370,19 +419,26 @@ internal class DeviceTextWriter(private val context: Context) {
         val reader = SentMessageReader(context)
         if (!reader.isGranted()) return 0
         val s = session() ?: return 0
-        if (s.captureOff || !s.captureSent) return 0
+        if (s.captureOff) return 0
 
         var index: ThreadIndex? = null
         var written = 0
         for (page in 0 until SENT_PAGES_PER_SYNC) {
             val watermark = reader.watermark()
-            val since = if (watermark > 0L) watermark else System.currentTimeMillis() - SENT_BACKFILL_MS
+            // 🛑 NO history import: the first sync on a phone starts at NOW, the
+            // same as the Dart side. Only texts sent from here on are filed.
+            if (watermark <= 0L) {
+                reader.ack(System.currentTimeMillis())
+                break
+            }
+            val since = watermark
             val rows = runCatching { reader.read(since, SENT_PAGE_SIZE) }.getOrElse { emptyList() }
             if (rows.isEmpty()) break
 
             val idx = index ?: ThreadIndex.load(s).also { index = it }
             val batch = s.db.batch()
             val newestPerThread = HashMap<String, SentRow>()
+            val oldestPerThread = HashMap<String, SentRow>()
             // Preview line per message, so the thread advance below can show
             // "📷 Photo" for a picture that carried no caption.
             val previews = HashMap<String, String>()
@@ -390,6 +446,9 @@ internal class DeviceTextWriter(private val context: Context) {
             var count = 0
             for (raw in rows) {
                 val row = SentRow.from(raw) ?: continue
+                // Past a text the list keeps out, so it is not re-read forever.
+                if (row.timestamp > newest) newest = row.timestamp
+                if (!passesSentList(s, row)) continue
                 val threadId = idx.resolve(row)
                 val threadRef = s.company.collection(COL_CONVERSATION).document(threadId)
                 val messageDocId = DartDocId.docIdFor(row.dedupKey)
@@ -421,6 +480,10 @@ internal class DeviceTextWriter(private val context: Context) {
                 val incumbent = newestPerThread[threadId]
                 if (incumbent == null || row.timestamp > incumbent.timestamp) {
                     newestPerThread[threadId] = row
+                }
+                val earliest = oldestPerThread[threadId]
+                if (earliest == null || row.timestamp < earliest.timestamp) {
+                    oldestPerThread[threadId] = row
                 }
                 if (row.timestamp > newest) newest = row.timestamp
             }
@@ -461,10 +524,136 @@ internal class DeviceTextWriter(private val context: Context) {
 
             // Only now: the batch is durable.
             if (newest > 0L) reader.ack(newest)
+            // Each conversation written to brings its past with it — once.
+            for ((threadId, row) in oldestPerThread) {
+                runCatching {
+                    pullHistory(
+                        s,
+                        threadId,
+                        handsetThreadId = row.threadId,
+                        beforeMillis = row.timestamp,
+                        whoForLookup = null,
+                    )
+                }.onFailure { Log.w(TAG, "history pull failed for $threadId: ${it.message}") }
+            }
             if (rows.size < SENT_PAGE_SIZE) break
         }
         return written
     }
+
+    // ── One conversation's history ──────────────────────────────────────────
+
+    /**
+     * Pulls the SMS/MMS past of ONE conversation, the first time a text is
+     * filed into it after setup — in either direction — and never the whole
+     * phone. Setting a phone up files nothing old (user, 2026-09-15): a person
+     * who texts, or is texted, brings their history with them. Once per thread
+     * (`deviceHistoryPulledAt`), the newest [HISTORY_LIMIT] messages older than
+     * [beforeMillis]. Only a thread that passed the Limit list gets here.
+     *
+     * The handset conversation comes from, in order: [handsetThreadId] (a sent
+     * text carries it), the thread's `deviceSmsThreadId`, or [whoForLookup] —
+     * the notification's name resolved to a number through the contacts, or
+     * the title itself when it IS a number. No match (an RCS-only chat, an
+     * unsaved sender) pulls nothing and marks nothing, so a later text that
+     * teaches the thread its number still can.
+     *
+     * 🛑 RCS has no readable store: an RCS chat's past cannot come in.
+     *
+     * Stamped `backfill: true`: indexed for search like any message
+     * (commSearchIndex), but no push, no secretary, no timeline card —
+     * messageDispatch skips backfills. Idempotent: ids are the provider row
+     * ids the sent-text sync uses, so a repeated pull rewrites the same docs.
+     */
+    private fun pullHistory(
+        s: Session,
+        threadId: String,
+        handsetThreadId: String?,
+        beforeMillis: Long,
+        whoForLookup: String?,
+    ) {
+        val reader = SentMessageReader(context)
+        if (!reader.isGranted() || beforeMillis <= 0L) return
+        val threadRef = s.company.collection(COL_CONVERSATION).document(threadId)
+        val snap = runCatching { await(threadRef.get()) }.getOrNull() ?: return
+        if (snap.get(FIELD_HISTORY_PULLED_AT) != null) return
+        val handset = handsetThreadId?.takeIf { it.isNotBlank() }
+            ?: (snap.get("deviceSmsThreadId") as? String)?.takeIf { it.isNotBlank() }
+            ?: whoForLookup?.trim()?.takeIf { it.isNotEmpty() }?.let { who ->
+                val number = if (SmsSender.looksLikeNumber(who)) who
+                else SmsSender(context).resolveNumber(who)
+                number?.let { reader.threadIdFor(it) }
+            }
+        val handsetId = handset?.toLongOrNull() ?: return
+
+        val rows = runCatching { reader.readThread(handsetId, beforeMillis, HISTORY_LIMIT) }
+            .getOrElse { return }
+        var batch = s.db.batch()
+        var inBatch = 0
+        for (raw in rows) {
+            val dedupKey = (raw["dedupKey"] as? String)?.takeIf { it.isNotEmpty() } ?: continue
+            val text = (raw["text"] as? String).orEmpty()
+            val parts = (raw["attachments"] as? List<*>)
+                ?.mapNotNull { p -> (p as? Map<*, *>)?.entries?.associate { it.key.toString() to it.value } }
+                ?: emptyList()
+            if (text.isBlank() && parts.isEmpty()) continue
+            val outgoing = raw["outgoing"] == true
+            val messageDocId = DartDocId.docIdFor(dedupKey)
+            val sender = raw["sender"] as? String
+            val doc = HashMap<String, Any?>()
+            doc["text"] = text
+            doc["senderRef"] = if (outgoing) s.memberRef else null
+            doc["senderName"] = if (outgoing) s.memberName
+            else (raw["senderName"] as? String) ?: sender?.let { nationalNumber(it) } ?: "Unknown"
+            doc["createdAt"] = Timestamp(Date((raw["timestamp"] as? Long) ?: 0L))
+            doc["readByMemberIds"] = listOf(s.memberRef.id)
+            doc["visibleToMemberIds"] = listOf(s.memberRef.id)
+            doc["attachments"] = uploadedAttachments(parts, s.company.id, messageDocId)
+            doc["isDeleted"] = false
+            doc["source"] = "device"
+            doc["deviceKind"] = raw["kind"]
+            doc["deviceSmsThreadId"] = handsetId.toString()
+            doc["deviceDedupKey"] = dedupKey
+            doc["deviceHistory"] = true
+            doc["backfill"] = true
+            doc["capturedAt"] = Timestamp.now()
+            doc["ingestedAt"] = FieldValue.serverTimestamp()
+            batch.set(
+                threadRef.collection(COL_MESSAGE).document(messageDocId),
+                doc,
+                SetOptions.merge(),
+            )
+            // Under Firestore's 500-write batch ceiling.
+            if (++inBatch >= 400) {
+                if (!commitHistory(batch)) return
+                batch = s.db.batch()
+                inBatch = 0
+            }
+        }
+        if (inBatch > 0 && !commitHistory(batch)) return
+        // Marked only after the messages are durable; the handset id also lets
+        // later sent texts file into this same thread.
+        runCatching {
+            await(
+                threadRef.set(
+                    mapOf(
+                        FIELD_HISTORY_PULLED_AT to FieldValue.serverTimestamp(),
+                        "deviceSmsThreadId" to handsetId.toString(),
+                    ),
+                    SetOptions.merge(),
+                ),
+            )
+        }.onFailure { Log.w(TAG, "history mark failed for $threadId: ${it.message}") }
+    }
+
+    private fun commitHistory(batch: com.google.firebase.firestore.WriteBatch): Boolean =
+        try {
+            await(batch.commit())
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "history batch failed: ${e.message}")
+            false
+        }
 
     /** The name a thread gets when a SENT text has to create it: its
      *  recipients, by contact name where the phone has one, else the number
@@ -674,7 +863,11 @@ internal class DeviceTextWriter(private val context: Context) {
                     doc["channel"] = "device"
                     doc["participantRefs"] = listOf(s.memberRef)
                     doc["participantNames"] = listOf(s.memberName)
-                    doc["commContextRefs"] = listOf(s.memberRef.path)
+                    // arrayUnion, never a list: the server files the thread
+                    // under the matching directory contact in this same field
+                    // (deviceThreadContacts.js), and a merge-set of a list
+                    // REPLACES it on every message.
+                    doc["commContextRefs"] = FieldValue.arrayUnion(s.memberRef.path)
                     doc["isGroup"] = isGroup
                     doc["lastMessageText"] = text
                     doc["lastMessageSenderName"] = senderName
@@ -711,6 +904,33 @@ private fun <T> await(task: Task<T>): T {
 private fun JSONObject.optStringOrNull(key: String): String? {
     if (!has(key) || isNull(key)) return null
     return optString(key)
+}
+
+/**
+ * Whether a capture names someone on the include/exclude list. A NAME
+ * matches exactly (case aside); an entry with seven or more digits matches
+ * on the last ten digits. 🛑 Mirrors `matchesIncomingList` in
+ * message_ingest_service.dart — keep them equal.
+ */
+internal fun matchesIncomingList(people: List<String>, names: List<String?>): Boolean {
+    fun digits(s: String) = s.filter { it.isDigit() }
+    fun last10(d: String) = if (d.length > 10) d.substring(d.length - 10) else d
+    for (raw in people) {
+        val entry = raw.trim()
+        if (entry.isEmpty()) continue
+        val entryDigits = digits(entry)
+        for (name in names) {
+            val value = name?.trim().orEmpty()
+            if (value.isEmpty()) continue
+            if (entryDigits.length >= 7) {
+                val valueDigits = digits(value)
+                if (valueDigits.length >= 7 && last10(valueDigits) == last10(entryDigits)) return true
+            } else if (value.equals(entry, ignoreCase = true)) {
+                return true
+            }
+        }
+    }
+    return false
 }
 
 /**
