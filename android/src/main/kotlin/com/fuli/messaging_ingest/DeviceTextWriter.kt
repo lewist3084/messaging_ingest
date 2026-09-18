@@ -255,6 +255,12 @@ internal class DeviceTextWriter(private val context: Context) {
         // Preview line per message, keyed on dedup key, so a picture with no
         // caption advances the thread as "📷 Photo" rather than as blank.
         val previews = HashMap<String, String>()
+        // 🛑 Loaded lazily, and the message is NOT filed without it. Until
+        // 2026-09-17 this path minted `device_<conversationKey>` without
+        // looking, so a reply to a text the member had SENT (filed by
+        // syncSent as `device_sms_<threadId>`) opened a second thread for
+        // the same people, and every message after it landed in both.
+        var index: ThreadIndex? = null
         var count = 0
         for (m in payloads) {
             val packageName = m.optString("packageName")
@@ -264,7 +270,9 @@ internal class DeviceTextWriter(private val context: Context) {
             val conversationKey = m.optString("conversationKey")
             val dedupKey = m.optString("dedupKey")
             if (conversationKey.isEmpty() || dedupKey.isEmpty()) continue
-            val threadId = DartDocId.deviceConversationId(conversationKey)
+            val idx = index ?: ThreadIndex.load(s)?.also { index = it }
+                ?: return Outcome.DEFER
+            val threadId = idx.resolveInbound(conversationKey, threadTitle(m))
             val threadRef = s.company.collection(COL_CONVERSATION).document(threadId)
             val fromMe = m.optBoolean("isFromMe", false)
             val senderName = m.optStringOrNull("senderName")
@@ -435,7 +443,8 @@ internal class DeviceTextWriter(private val context: Context) {
             val rows = runCatching { reader.read(since, SENT_PAGE_SIZE) }.getOrElse { emptyList() }
             if (rows.isEmpty()) break
 
-            val idx = index ?: ThreadIndex.load(s).also { index = it }
+            // Watermark untouched on failure: the next sync re-reads.
+            val idx = index ?: ThreadIndex.load(s)?.also { index = it } ?: break
             val batch = s.db.batch()
             val newestPerThread = HashMap<String, SentRow>()
             val oldestPerThread = HashMap<String, SentRow>()
@@ -767,17 +776,22 @@ internal class DeviceTextWriter(private val context: Context) {
         else if (attachments.size == 1) "📷 Photo"
         else "📷 ${attachments.size} photos"
 
-    /** The member's device threads, indexed for filing sent texts. Mirrors
-     *  `_DeviceThreadIndex`. */
+    /** The member's device threads, indexed for filing texts in EITHER
+     *  direction. Mirrors `_DeviceThreadIndex`. */
     private class ThreadIndex(
         private val byHandsetThread: HashMap<String, String>,
+        private val byConversationKey: HashMap<String, String>,
         private val byParties: HashMap<String, String>,
     ) {
         private val created = HashSet<String>()
 
         companion object {
-            fun load(s: Session): ThreadIndex {
+            /** Null when the read failed: a caller that cannot see the
+             *  existing threads must not file, or it re-creates the split
+             *  this index exists to prevent. */
+            fun load(s: Session): ThreadIndex? {
                 val byHandset = HashMap<String, String>()
+                val byKey = HashMap<String, String>()
                 val byParties = HashMap<String, String>()
                 val snap = runCatching {
                     // list-cap: 500. One member's own phone; the live member
@@ -790,20 +804,43 @@ internal class DeviceTextWriter(private val context: Context) {
                             .limit(500)
                             .get(),
                     )
-                }.getOrNull()
-                if (snap != null) {
-                    for (doc in snap.documents) {
-                        val handset = (doc.get("deviceSmsThreadId") as? String)?.trim().orEmpty()
-                        if (handset.isNotEmpty()) byHandset[handset] = doc.id
-                        val title = (doc.get("title") as? String).orEmpty()
-                        val key = partiesKey(title.split(','))
-                        // First one wins: two threads with the same people
-                        // keep filing into the same one.
-                        if (key.isNotEmpty() && !byParties.containsKey(key)) byParties[key] = doc.id
-                    }
+                }.onFailure { Log.w(TAG, "thread index load failed: ${it.message}") }
+                    .getOrNull() ?: return null
+                for (doc in snap.documents) {
+                    val handset = (doc.get("deviceSmsThreadId") as? String)?.trim().orEmpty()
+                    if (handset.isNotEmpty()) byHandset[handset] = doc.id
+                    val key = (doc.get("deviceConversationKey") as? String)?.trim().orEmpty()
+                    if (key.isNotEmpty()) byKey[key] = doc.id
+                    val title = (doc.get("title") as? String).orEmpty()
+                    val parties = partiesKey(title.split(','))
+                    // First one wins: two threads with the same people
+                    // keep filing into the same one.
+                    if (parties.isNotEmpty() && !byParties.containsKey(parties)) byParties[parties] = doc.id
                 }
-                return ThreadIndex(byHandset, byParties)
+                return ThreadIndex(byHandset, byKey, byParties)
             }
+        }
+
+        /**
+         * The conversation a captured NOTIFICATION belongs in: the thread
+         * that already carries this `deviceConversationKey`, else the thread
+         * with the same people in its title (the one `syncSent` made when
+         * the member wrote first — `partiesKey` sorts, so the handset's
+         * recipient order and Google Messages' title order agree), else a
+         * new `device_<conversationKey>`. The thread advance stamps the key
+         * on whichever it lands on, so the next notification is a lookup.
+         */
+        fun resolveInbound(conversationKey: String, title: String?): String {
+            byConversationKey[conversationKey]?.let { return it }
+            val key = partiesKey(title.orEmpty().split(','))
+            val byTitle = if (key.isEmpty()) null else byParties[key]
+            val id = byTitle ?: DartDocId.deviceConversationId(conversationKey)
+            if (byTitle == null) {
+                created.add(id)
+                if (key.isNotEmpty()) byParties[key] = id
+            }
+            byConversationKey[conversationKey] = id
+            return id
         }
 
         fun resolve(row: SentRow): String {
