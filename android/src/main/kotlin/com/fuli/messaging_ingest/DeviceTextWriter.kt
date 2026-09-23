@@ -16,6 +16,7 @@ import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreSettings
 import com.google.firebase.firestore.PersistentCacheSettings
+import com.google.firebase.firestore.Query
 import com.google.firebase.firestore.SetOptions
 import org.json.JSONObject
 import java.util.Date
@@ -252,6 +253,9 @@ internal class DeviceTextWriter(private val context: Context) {
 
         val batch = s.db.batch()
         val newestPerThread = HashMap<String, JSONObject>()
+        // What each thread already holds — see [ThreadDedupe].
+        val dedupers = HashMap<String, ThreadDedupe>()
+        var merged = 0
         // Preview line per message, keyed on dedup key, so a picture with no
         // caption advances the thread as "📷 Photo" rather than as blank.
         val previews = HashMap<String, String>()
@@ -280,6 +284,33 @@ internal class DeviceTextWriter(private val context: Context) {
             val postedAt = m.optLong("postedAt", timestamp)
 
             val messageDocId = DartDocId.docIdFor(dedupKey)
+            val text = m.optString("text")
+            // 🛑 THE SAME TEXT, CAPTURED TWICE. This path keys on the
+            // notification (`<package>|<conv>|<ts>|<sender>|<hash>`) and the
+            // provider path keys on the SMS/MMS row id (`mms|37026`), so
+            // neither could ever see the other's copy — and both capture an
+            // outgoing text. Ask the thread what it already holds.
+            val dedupe = dedupers.getOrPut(threadId) {
+                ThreadDedupe.recent(threadRef)
+            }
+            val twin = dedupe.duplicateOf(dedupKey, fromMe, text, timestamp)
+            if (twin != null) {
+                batch.set(
+                    threadRef.collection(COL_MESSAGE).document(twin),
+                    mapOf(
+                        // So the next sweep matches on the KEY and never has
+                        // to guess from text and time again.
+                        "deviceDedupKeyAlt" to FieldValue.arrayUnion(dedupKey),
+                        "devicePackageName" to packageName,
+                        // The one thing only this path knows: whether the
+                        // notification can still be replied to.
+                        "canReply" to m.optBoolean("canReply", false),
+                    ),
+                    SetOptions.merge(),
+                )
+                merged++
+                continue
+            }
             // A picture arrives as a notification data URI beside an empty
             // text. The grant on it dies with the notification, so it is
             // copied to Storage HERE — there is no later.
@@ -298,7 +329,6 @@ internal class DeviceTextWriter(private val context: Context) {
                 s.company.id,
                 messageDocId,
             )
-            val text = m.optString("text")
 
             val doc = HashMap<String, Any?>()
             doc["text"] = text
@@ -322,6 +352,7 @@ internal class DeviceTextWriter(private val context: Context) {
                 SetOptions.merge(),
             )
             count++
+            dedupe.record(messageDocId, dedupKey, fromMe, text, timestamp)
             previews[dedupKey] = previewText(text, attachments)
 
             val incumbent = newestPerThread[threadId]
@@ -329,7 +360,8 @@ internal class DeviceTextWriter(private val context: Context) {
                 newestPerThread[threadId] = m
             }
         }
-        if (count == 0) return Outcome.HANDLED
+        // Nothing new, but a merge may still be waiting to be written.
+        if (count == 0 && merged == 0) return Outcome.HANDLED
 
         try {
             await(batch.commit())
@@ -448,6 +480,8 @@ internal class DeviceTextWriter(private val context: Context) {
             val batch = s.db.batch()
             val newestPerThread = HashMap<String, SentRow>()
             val oldestPerThread = HashMap<String, SentRow>()
+            val dedupers = HashMap<String, ThreadDedupe>()
+            var merged = 0
             // Preview line per message, so the thread advance below can show
             // "📷 Photo" for a picture that carried no caption.
             val previews = HashMap<String, String>()
@@ -461,6 +495,28 @@ internal class DeviceTextWriter(private val context: Context) {
                 val threadId = idx.resolve(row)
                 val threadRef = s.company.collection(COL_CONVERSATION).document(threadId)
                 val messageDocId = DartDocId.docIdFor(row.dedupKey)
+                // The notification listener has usually already filed this
+                // very text — see the note on the inbound path.
+                val dedupe = dedupers.getOrPut(threadId) {
+                    ThreadDedupe.recent(threadRef)
+                }
+                val twin = dedupe.duplicateOf(row.dedupKey, true, row.text, row.timestamp)
+                if (twin != null) {
+                    batch.set(
+                        threadRef.collection(COL_MESSAGE).document(twin),
+                        mapOf(
+                            "deviceDedupKeyAlt" to FieldValue.arrayUnion(row.dedupKey),
+                            // What only the provider knows: which handset
+                            // thread this is, and the numbers it went to.
+                            "deviceKind" to row.kind,
+                            "deviceSmsThreadId" to row.threadId,
+                            "deviceRecipients" to row.addresses,
+                        ),
+                        SetOptions.merge(),
+                    )
+                    merged++
+                    continue
+                }
                 val attachments =
                     uploadedAttachments(row.attachments, s.company.id, messageDocId)
                 val doc = HashMap<String, Any?>()
@@ -485,6 +541,7 @@ internal class DeviceTextWriter(private val context: Context) {
                     SetOptions.merge(),
                 )
                 count++
+                dedupe.record(messageDocId, row.dedupKey, true, row.text, row.timestamp)
                 previews[row.dedupKey] = previewText(row.text, attachments)
                 val incumbent = newestPerThread[threadId]
                 if (incumbent == null || row.timestamp > incumbent.timestamp) {
@@ -496,7 +553,7 @@ internal class DeviceTextWriter(private val context: Context) {
                 }
                 if (row.timestamp > newest) newest = row.timestamp
             }
-            if (count == 0) {
+            if (count == 0 && merged == 0) {
                 // Nothing usable on this page (blank texts, no recipients);
                 // move the watermark past it or the same page returns forever.
                 val last = rows.maxOfOrNull { (it["timestamp"] as? Long) ?: 0L } ?: 0L
@@ -597,6 +654,13 @@ internal class DeviceTextWriter(private val context: Context) {
 
         val rows = runCatching { reader.readThread(handsetId, beforeMillis, HISTORY_LIMIT) }
             .getOrElse { return }
+        // 🛑 The history sweep re-reads MONTHS of the handset's own database,
+        // and the notification listener has already filed everything it saw
+        // live. On 2026-09-17 that put a second copy of every message from
+        // 2026-09-09 onward into the threads it swept. The window here spans
+        // the whole pull, not the newest few.
+        val oldest = rows.mapNotNull { it["timestamp"] as? Long }.minOrNull() ?: 0L
+        val dedupe = ThreadDedupe.since(threadRef, oldest - ThreadDedupe.WINDOW_MS)
         var batch = s.db.batch()
         var inBatch = 0
         for (raw in rows) {
@@ -608,6 +672,29 @@ internal class DeviceTextWriter(private val context: Context) {
             if (text.isBlank() && parts.isEmpty()) continue
             val outgoing = raw["outgoing"] == true
             val messageDocId = DartDocId.docIdFor(dedupKey)
+            val historyMillis = (raw["timestamp"] as? Long) ?: 0L
+            val twin = dedupe.duplicateOf(dedupKey, outgoing, text, historyMillis)
+            if (twin != null) {
+                // Built rather than literal: a merge-set writes an explicit
+                // null, so handing it `raw["kind"]` when the sweep did not
+                // report one would BLANK the field on the survivor.
+                val fold = HashMap<String, Any?>()
+                fold["deviceDedupKeyAlt"] = FieldValue.arrayUnion(dedupKey)
+                (raw["kind"] as? String)?.takeIf { it.isNotEmpty() }
+                    ?.let { fold["deviceKind"] = it }
+                fold["deviceSmsThreadId"] = handsetId.toString()
+                batch.set(
+                    threadRef.collection(COL_MESSAGE).document(twin),
+                    fold,
+                    SetOptions.merge(),
+                )
+                if (++inBatch >= 400) {
+                    if (!commitHistory(batch)) return
+                    batch = s.db.batch()
+                    inBatch = 0
+                }
+                continue
+            }
             val sender = raw["sender"] as? String
             val doc = HashMap<String, Any?>()
             doc["text"] = text
@@ -631,6 +718,13 @@ internal class DeviceTextWriter(private val context: Context) {
                 threadRef.collection(COL_MESSAGE).document(messageDocId),
                 doc,
                 SetOptions.merge(),
+            )
+            dedupe.record(
+                messageDocId,
+                dedupKey,
+                outgoing,
+                text,
+                historyMillis,
             )
             // Under Firestore's 500-write batch ceiling.
             if (++inBatch >= 400) {
@@ -778,6 +872,140 @@ internal class DeviceTextWriter(private val context: Context) {
 
     /** The member's device threads, indexed for filing texts in EITHER
      *  direction. Mirrors `_DeviceThreadIndex`. */
+    /**
+     * What a thread ALREADY holds, so two capture paths cannot file one text
+     * twice.
+     *
+     * Every path keys its documents on a dedup key of its own making — the
+     * notification listener on `<package>|<conversation>|<ts>|<sender>|<hash>`,
+     * the SMS/MMS provider on `mms|37026`, the history sweep on the same
+     * provider ids. The document id is derived from that key, so each path is
+     * perfectly idempotent WITH ITSELF and blind to every other. An outgoing
+     * text is seen by two of them and a swept conversation by all three, which
+     * is why "sure" arrived in the thread twice, 1.8 seconds apart.
+     *
+     * There is no id to join on: the provider truncates the timestamp to whole
+     * seconds and reports it about a second off the notification's. So the
+     * match is on CONTENT — same direction, same words, within [WINDOW_MS] —
+     * and only ACROSS namespaces: two rows from one path with the same words
+     * are two real messages (somebody typed "ok" twice), and dropping one of
+     * those would be losing a message to hide a duplicate.
+     *
+     * A match is consumed, so a genuine pair of identical texts pairs off
+     * one-to-one against the other path's pair instead of collapsing to one.
+     * The survivor takes the newcomer's key in `deviceDedupKeyAlt`, and the
+     * next sweep matches on that key exactly, with no guessing.
+     */
+    private class ThreadDedupe private constructor(private val rows: MutableList<Row>) {
+
+        private class Row(
+            val id: String,
+            val namespace: String,
+            val alts: MutableSet<String>,
+            val outgoing: Boolean,
+            val text: String,
+            val millis: Long,
+            var claimed: Boolean = false,
+        )
+
+        /**
+         * The id of the message already holding this text, or null when it is
+         * new to the thread.
+         */
+        fun duplicateOf(dedupKey: String, outgoing: Boolean, text: String, millis: Long): String? {
+            val ns = namespaceOf(dedupKey)
+            val body = normalize(text)
+            // Written by an earlier sweep that already folded this key in.
+            rows.firstOrNull { it.alts.contains(dedupKey) }?.let { return it.id }
+            if (body.isEmpty()) return null
+            return rows.firstOrNull { row ->
+                !row.claimed &&
+                    row.namespace != ns &&
+                    row.outgoing == outgoing &&
+                    row.text == body &&
+                    kotlin.math.abs(row.millis - millis) <= WINDOW_MS
+            }?.also {
+                it.claimed = true
+                it.alts.add(dedupKey)
+            }?.id
+        }
+
+        /** Adds a message this batch is about to write. */
+        fun record(docId: String, dedupKey: String, outgoing: Boolean, text: String, millis: Long) {
+            rows.add(
+                Row(
+                    id = docId,
+                    namespace = namespaceOf(dedupKey),
+                    alts = mutableSetOf(dedupKey),
+                    outgoing = outgoing,
+                    text = normalize(text),
+                    millis = millis,
+                )
+            )
+        }
+
+        companion object {
+            /** Observed gap between the two paths is ~2s; this is slack, not a guess. */
+            const val WINDOW_MS = 120_000L
+            private const val FIELD_CREATED = "createdAt"
+            private const val RECENT = 80L
+            private const val SWEEP = 500L
+
+            /** The newest messages — enough for a live capture or a sent page. */
+            fun recent(threadRef: DocumentReference): ThreadDedupe = load(
+                threadRef.collection(COL_MESSAGE)
+                    .orderBy(FIELD_CREATED, Query.Direction.DESCENDING)
+                    .limit(RECENT)
+            )
+
+            /** Everything since [sinceMillis] — for a sweep that reaches back months. */
+            fun since(threadRef: DocumentReference, sinceMillis: Long): ThreadDedupe = load(
+                threadRef.collection(COL_MESSAGE)
+                    .whereGreaterThanOrEqualTo(
+                        FIELD_CREATED,
+                        Timestamp(Date(maxOf(0L, sinceMillis))),
+                    )
+                    .orderBy(FIELD_CREATED, Query.Direction.DESCENDING)
+                    .limit(SWEEP)
+            )
+
+            private fun load(query: Query): ThreadDedupe {
+                val rows = ArrayList<Row>()
+                // A thread we cannot read is a thread we cannot dedupe
+                // against. Writing the message anyway is the safe failure:
+                // a duplicate can be merged later, a dropped text cannot be
+                // recovered from anywhere.
+                val snap = runCatching { await(query.get()) }.getOrNull()
+                for (doc in snap?.documents.orEmpty()) {
+                    val key = (doc.get("deviceDedupKey") as? String).orEmpty()
+                    val alts = HashSet<String>()
+                    if (key.isNotEmpty()) alts.add(key)
+                    // Star projection: no unchecked cast, so no suppression.
+                    (doc.get("deviceDedupKeyAlt") as? Iterable<*>)?.forEach { alt ->
+                        (alt as? String)?.takeIf { it.isNotEmpty() }?.let { alts.add(it) }
+                    }
+                    val at = (doc.get(FIELD_CREATED) as? Timestamp)?.toDate()?.time ?: continue
+                    rows.add(
+                        Row(
+                            id = doc.id,
+                            namespace = namespaceOf(key),
+                            alts = alts.toMutableSet(),
+                            outgoing = doc.get("senderRef") != null,
+                            text = normalize((doc.get("text") as? String).orEmpty()),
+                            millis = at,
+                        )
+                    )
+                }
+                return ThreadDedupe(rows)
+            }
+
+            /** The capture path a key came from: `mms`, `sms`, the app id. */
+            private fun namespaceOf(key: String): String = key.substringBefore('|')
+
+            private fun normalize(text: String): String = text.trim().lowercase()
+        }
+    }
+
     private class ThreadIndex(
         private val byHandsetThread: HashMap<String, String>,
         private val byConversationKey: HashMap<String, String>,
