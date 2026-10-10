@@ -336,7 +336,10 @@ internal class DeviceTextWriter(private val context: Context) {
             doc["senderName"] = if (fromMe) s.memberName else (senderName ?: "Unknown")
             // The time it was SENT, not the time it reached Firestore.
             doc["createdAt"] = Timestamp(Date(timestamp))
-            doc["readByMemberIds"] = listOf(s.memberRef.id)
+            // Unread until the member says otherwise — the rail node on the
+            // timeline, opening the thread, or replying. A notification on
+            // the phone is not proof it was read. Their own text is read.
+            doc["readByMemberIds"] = if (fromMe) listOf(s.memberRef.id) else emptyList()
             doc["visibleToMemberIds"] = listOf(s.memberRef.id)
             doc["attachments"] = attachments
             doc["isDeleted"] = false
