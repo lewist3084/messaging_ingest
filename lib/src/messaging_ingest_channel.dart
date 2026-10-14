@@ -113,9 +113,12 @@ class MessagingIngest {
         false;
   }
 
-  /// Runs the phone's own sent-text sync — the SMS/MMS store read and filed
-  /// from native, the same pages and watermark the Dart sync used. Returns
-  /// how many were written. Needs [configure].
+  /// Runs the phone's own pass over its SMS/MMS store — sent texts, the
+  /// same pages and watermark the Dart sync used, and since 2026-10-13 the
+  /// INBOX too, under its own watermark: a reply that arrives while its
+  /// thread is open on the phone posts no notification, and the store is
+  /// the only place it exists. Returns how many were written. Needs
+  /// [configure]. The name is historical; the native method is `syncSent`.
   Future<int> syncSentNative() async {
     if (!isSupported) return 0;
     return await _methods.invokeMethod<int>('syncSent') ?? 0;
@@ -219,15 +222,20 @@ class MessagingIngest {
   // ── Replying from this handset ──────────────────────────────────────────
   //
   // The member typed the reply somewhere else (their computer); this phone
-  // is what sends it. Two routes. The conversation's posted notification is
-  // tried first: it answers RCS as well as SMS and lands in the exact thread,
-  // but exists only until the thread is read on the phone. Then plain SMS to
-  // one number. Neither writes a message doc — the sent text is captured
-  // back through the normal paths (the re-posted notification, or the SMS
-  // provider's sent row on the next sync).
+  // is what sends it. Two routes. The conversation's notification reply box
+  // is tried first: it answers RCS as well as SMS, it is the only way into a
+  // GROUP, and it lands in the exact thread. The phone keeps the box after
+  // the notification is dismissed and rebuilds it from the shade after a
+  // restart (2026-10-14), so it is there for as long as the system keeps the
+  // intent. Then plain SMS to one number. A group reply with no box waits in
+  // the outbox and the phone sends it, natively, the moment the thread posts
+  // again (`DeviceTextWriter.sendWaitingReplies`).
 
-  /// Whether [conversationKey]'s notification is still posted with a reply
-  /// box attached.
+  /// Whether this phone holds a reply box for [conversationKey]: the
+  /// notification is posted, or was posted and dismissed since the listener
+  /// process last started (the box is kept — see the listener's
+  /// `replyTargets`). A check only; [replyInline] makes the same lookup and
+  /// reads the shade itself when the box is not remembered.
   Future<bool> canReplyInline(String conversationKey) async {
     if (!isSupported || conversationKey.isEmpty) return false;
     final ok = await _methods.invokeMethod<bool>('canReplyInline', {
@@ -236,9 +244,11 @@ class MessagingIngest {
     return ok ?? false;
   }
 
-  /// Fires [text] into the posted notification's reply action. False when
-  /// there is no live reply box (the notification was dismissed); throws a
-  /// [PlatformException] if the system refused to fire it.
+  /// Fires [text] into the conversation's notification reply box — posted or
+  /// kept. False when this phone has no box for it, or the system reports
+  /// the box dead; throws a [PlatformException] if the system refused to
+  /// fire it for any other reason. The caller falls through to its next
+  /// route on either.
   Future<bool> replyInline(String conversationKey, String text) async {
     if (!isSupported) return false;
     final ok = await _methods.invokeMethod<bool>('replyInline', {

@@ -49,6 +49,14 @@ internal class SentMessageReader(private val context: Context) {
     companion object {
         private const val KEY_WATERMARK = "sentWatermarkMs"
 
+        /**
+         * The inbound side's own watermark. 🛑 Not the sent one: a phone
+         * updated to this code carries a sent watermark days old, and reading
+         * the inbox back to it would re-file every reply the notification
+         * path already captured — as NEW, unread texts.
+         */
+        private const val KEY_INBOX_WATERMARK = "inboxWatermarkMs"
+
         /** PduHeaders.TO — the recipients of an outgoing MMS. */
         private const val MMS_ADDR_TO = 151
 
@@ -312,6 +320,145 @@ internal class SentMessageReader(private val context: Context) {
         }
         return out
     }
+
+    // ── Inbound texts (the same store, the other direction) ────────────────
+
+    /** Epoch millis of the newest INBOUND message already handed over, or 0. */
+    fun inboxWatermark(): Long = prefs.getLong(KEY_INBOX_WATERMARK, 0L)
+
+    /** Advances the inbound watermark. Never moves it backwards. */
+    fun ackInbox(untilMillis: Long) {
+        if (untilMillis > inboxWatermark()) {
+            prefs.edit().putLong(KEY_INBOX_WATERMARK, untilMillis).apply()
+        }
+    }
+
+    /**
+     * SMS and MMS that ARRIVED after [sinceMillis], oldest first, at most
+     * [limit] — the inbound twin of [read].
+     *
+     * The notification listener is the live inbound route, and the only one
+     * for RCS. But Google Messages posts NO notification for the conversation
+     * that is open on the screen, so a reply that comes in while the member
+     * is reading that very thread on the handset reaches nothing (measured
+     * 2026-10-13: a reply to a text sent from the app, lost). An SMS or MMS
+     * lands in the provider whatever is on screen, so the store is read in
+     * both directions and the two paths meet in the writer's dedupe exactly
+     * as a sent text's two copies do. An RCS reply to an open thread is
+     * still invisible — there is no store to read it from.
+     *
+     * Each row carries `sender` (the address), `senderName` (its contact, when
+     * the phone has one), and `others`: the TO addresses an MMS names beside
+     * the handset's own placeholder. The writer reads `others` to tell a
+     * group it cannot place from a 1:1 it can.
+     */
+    fun readInbox(sinceMillis: Long, limit: Int): List<Map<String, Any?>> {
+        if (!isGranted()) return emptyList()
+        val out = ArrayList<Map<String, Any?>>()
+        runCatching { readInboxSms(sinceMillis, limit, out) }
+        runCatching { readInboxMms(sinceMillis, limit, out) }
+        out.sortBy { it["timestamp"] as Long }
+        return if (out.size > limit) ArrayList(out.subList(0, limit)) else out
+    }
+
+    private fun readInboxSms(sinceMillis: Long, limit: Int, out: MutableList<Map<String, Any?>>) {
+        val projection = arrayOf(
+            Telephony.Sms._ID,
+            Telephony.Sms.THREAD_ID,
+            Telephony.Sms.ADDRESS,
+            Telephony.Sms.BODY,
+            Telephony.Sms.DATE,
+        )
+        context.contentResolver.query(
+            Telephony.Sms.Inbox.CONTENT_URI,
+            projection,
+            "${Telephony.Sms.DATE} > ?",
+            arrayOf(sinceMillis.toString()),
+            "${Telephony.Sms.DATE} ASC LIMIT $limit",
+        )?.use { c ->
+            val iId = c.getColumnIndexOrThrow(Telephony.Sms._ID)
+            val iThread = c.getColumnIndexOrThrow(Telephony.Sms.THREAD_ID)
+            val iAddr = c.getColumnIndexOrThrow(Telephony.Sms.ADDRESS)
+            val iBody = c.getColumnIndexOrThrow(Telephony.Sms.BODY)
+            val iDate = c.getColumnIndexOrThrow(Telephony.Sms.DATE)
+            while (c.moveToNext()) {
+                val body = c.getString(iBody) ?: continue
+                if (body.isBlank()) continue
+                val sender = c.getString(iAddr)?.trim().orEmpty()
+                if (sender.isEmpty()) continue
+                out.add(
+                    inboxPayload(
+                        kind = "sms",
+                        id = c.getLong(iId),
+                        threadId = c.getLong(iThread),
+                        sender = sender,
+                        others = emptyList(),
+                        text = body,
+                        timestamp = c.getLong(iDate),
+                    )
+                )
+            }
+        }
+    }
+
+    private fun readInboxMms(sinceMillis: Long, limit: Int, out: MutableList<Map<String, Any?>>) {
+        // MMS dates are SECONDS — see readMms.
+        val sinceSeconds = sinceMillis / 1000
+        context.contentResolver.query(
+            Telephony.Mms.CONTENT_URI,
+            arrayOf(Telephony.Mms._ID, Telephony.Mms.THREAD_ID, Telephony.Mms.DATE),
+            "${Telephony.Mms.MESSAGE_BOX} = ? AND ${Telephony.Mms.DATE} > ?",
+            arrayOf(Telephony.Mms.MESSAGE_BOX_INBOX.toString(), sinceSeconds.toString()),
+            "${Telephony.Mms.DATE} ASC LIMIT $limit",
+        )?.use { c ->
+            val iId = c.getColumnIndexOrThrow(Telephony.Mms._ID)
+            val iThread = c.getColumnIndexOrThrow(Telephony.Mms.THREAD_ID)
+            val iDate = c.getColumnIndexOrThrow(Telephony.Mms.DATE)
+            while (c.moveToNext()) {
+                val id = c.getLong(iId)
+                val text = mmsText(id).orEmpty()
+                val attachments = mmsAttachments(id)
+                if (text.isBlank() && attachments.isEmpty()) continue
+                val sender = mmsFrom(id) ?: continue
+                out.add(
+                    inboxPayload(
+                        kind = "mms",
+                        id = id,
+                        threadId = c.getLong(iThread),
+                        sender = sender,
+                        others = mmsRecipients(id),
+                        text = text,
+                        timestamp = c.getLong(iDate) * 1000,
+                        attachments = attachments,
+                    )
+                )
+            }
+        }
+    }
+
+    private fun inboxPayload(
+        kind: String,
+        id: Long,
+        threadId: Long,
+        sender: String,
+        others: List<String>,
+        text: String,
+        timestamp: Long,
+        attachments: List<Map<String, Any?>> = emptyList(),
+    ): Map<String, Any?> = hashMapOf(
+        // The same key the sent sync and the history pull use for this row,
+        // so every provider path is idempotent with every other.
+        "dedupKey" to "$kind|$id",
+        "kind" to kind,
+        "threadId" to threadId.toString(),
+        "outgoing" to false,
+        "sender" to sender,
+        "senderName" to nameFor(sender),
+        "others" to ArrayList(others),
+        "text" to text,
+        "timestamp" to timestamp,
+        "attachments" to ArrayList(attachments),
+    )
 
     // ── One conversation's history ──────────────────────────────────────────
 

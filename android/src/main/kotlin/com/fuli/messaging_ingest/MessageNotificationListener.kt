@@ -43,33 +43,91 @@ class MessageNotificationListener : NotificationListenerService() {
         )
 
         /**
-         * The live reply box of each conversation whose notification is still
-         * posted: the RemoteInput action Google Messages attached, keyed on
-         * the same conversation key the capture uses. Firing it with text is
-         * how a smartwatch or Android Auto answers a thread, and it is the
-         * ONLY route into an RCS chat any third-party app has. It exists only
-         * while the notification does — reading the thread on the phone
-         * dismisses it, and [onNotificationRemoved] drops the entry.
+         * The reply box of each conversation this process has seen a
+         * notification for: the RemoteInput action Google Messages attached,
+         * keyed on the same conversation key the capture uses. Firing it with
+         * text is how a smartwatch or Android Auto answers a thread, and it is
+         * the ONLY route into an RCS chat — or a GROUP chat of any kind — that
+         * a third-party app has.
+         *
+         * 🛑 KEPT AFTER THE NOTIFICATION IS DISMISSED. Until 2026-10-14 the
+         * entry was dropped in [onNotificationRemoved], on the theory that a
+         * dismissed notification's intent is dead. It is not: a PendingIntent
+         * is a record in system_server that lives as long as anyone holds it,
+         * and Google Messages neither cancels its reply intents on dismissal
+         * nor checks for a posted notification when one fires. Dropping the
+         * entry meant every group reply typed on the computer more than a few
+         * hours after the last text failed with "reply from the phone" — the
+         * member had simply read the thread. Now the box is kept, marked
+         * [ReplyTarget.dismissedAt], and only the SYSTEM retires it: a
+         * `CanceledException` on send is the one proof that it is gone.
+         *
+         * The map is in memory because a PendingIntent cannot be written to
+         * disk (its binder does not marshal). A process restart — app update,
+         * a force-stop, memory pressure — therefore empties it, and
+         * [rememberReplyTargetsOnShade] refills it from whatever is still
+         * posted, both on connect and the first time a key is missed.
          */
         private val replyTargets =
             java.util.concurrent.ConcurrentHashMap<String, ReplyTarget>()
 
+        /** The bound service, while it is connected — what [replyTargetFor]
+         *  reads the shade through. */
+        @Volatile
+        private var instance: MessageNotificationListener? = null
+
+        /** A box last seen posted or dismissed longer ago than this is
+         *  forgotten: the thread has had nothing to say for a month. */
+        private const val REPLY_TARGET_TTL_MS = 30L * 24 * 60 * 60 * 1000
+
         internal fun canReplyInline(conversationKey: String): Boolean =
-            replyTargets.containsKey(conversationKey)
+            replyTargetFor(conversationKey) != null
+
+        /** How the box for [conversationKey] stands — for the outbox row's
+         *  diagnosis, never for a decision. */
+        internal fun replyBoxState(conversationKey: String): String {
+            val t = replyTargetFor(conversationKey) ?: return "none"
+            return if (t.dismissedAt == 0L) "posted" else "kept"
+        }
+
+        private fun replyTargetFor(conversationKey: String): ReplyTarget? {
+            if (conversationKey.isEmpty()) return null
+            replyTargets[conversationKey]?.let { return it }
+            // Not remembered: this process may have started after the
+            // notification was posted. The shade still has it if the member
+            // has not read the thread.
+            instance?.rememberReplyTargetsOnShade()
+            return replyTargets[conversationKey]
+        }
 
         /**
-         * Answers [conversationKey] through its posted notification. False
-         * when there is no live reply box; throws if the system refused to
-         * fire the action (the intent was cancelled under us).
+         * Answers [conversationKey] through its notification's reply box —
+         * posted or kept. False when this phone has no box for it, or the
+         * system reports the box dead (the one case the box is dropped);
+         * throws if the system refused to fire it for any other reason.
          */
         internal fun replyInline(context: android.content.Context, conversationKey: String, text: String): Boolean {
-            val target = replyTargets[conversationKey] ?: return false
+            val target = replyTargetFor(conversationKey) ?: return false
             val intent = android.content.Intent()
             val results = android.os.Bundle().apply { putCharSequence(target.remoteInput.resultKey, text) }
             androidx.core.app.RemoteInput.addResultsToIntent(arrayOf(target.remoteInput), intent, results)
+            // What a keyboard reply says about itself; Messages reads it to
+            // tell typed text from a canned choice.
+            androidx.core.app.RemoteInput.setResultsSource(
+                intent,
+                androidx.core.app.RemoteInput.SOURCE_FREE_FORM_INPUT,
+            )
             val pending = target.action.actionIntent
                 ?: throw IllegalStateException("reply action carries no intent")
-            pending.send(context, 0, intent)
+            try {
+                pending.send(context, 0, intent)
+            } catch (e: android.app.PendingIntent.CanceledException) {
+                // The messaging app cancelled this intent (it was updated, or
+                // it rebuilt its notification with a new one). The box is
+                // dead; forget it so the next look reads the shade afresh.
+                replyTargets.remove(conversationKey, target)
+                return false
+            }
             return true
         }
     }
@@ -78,13 +136,64 @@ class MessageNotificationListener : NotificationListenerService() {
         val sbnKey: String,
         val action: androidx.core.app.NotificationCompat.Action,
         val remoteInput: androidx.core.app.RemoteInput,
-    )
+        /** When the notification was last posted or re-posted. */
+        val seenAt: Long = System.currentTimeMillis(),
+    ) {
+        /** 0 while the notification is on the shade; the time it left it
+         *  otherwise. The box is kept either way. */
+        @Volatile
+        var dismissedAt: Long = 0L
+    }
 
     override fun onNotificationRemoved(sbn: StatusBarNotification) {
         // Keyed on conversation, removed by notification: the two are 1:1 for
-        // Google Messages, and a stale entry would fire a cancelled intent.
-        val gone = replyTargets.entries.filter { it.value.sbnKey == sbn.key }.map { it.key }
-        for (k in gone) replyTargets.remove(k)
+        // Google Messages. The box stays — see [replyTargets] — and is only
+        // marked, so a later send can say which kind of box carried it.
+        val now = System.currentTimeMillis()
+        for (t in replyTargets.values) {
+            if (t.sbnKey == sbn.key && t.dismissedAt == 0L) t.dismissedAt = now
+        }
+    }
+
+    /**
+     * Refills [replyTargets] from every notification still on the shade from
+     * the phone's texting app. Called on connect (a process restart has just
+     * emptied the map) and when a key is asked for that the map lacks. It
+     * records boxes only; it files no message — every text on the shade is
+     * either in the seen-ledger already or about to arrive through
+     * [onNotificationPosted].
+     */
+    internal fun rememberReplyTargetsOnShade() {
+        // Throws when the listener is not connected; nothing to read then.
+        val posted = runCatching { activeNotifications }.getOrNull() ?: return
+        val allowed = allowedPackages()
+        for (sbn in posted) {
+            if (sbn.packageName !in allowed) continue
+            runCatching { rememberReplyTarget(sbn) }
+        }
+        // `Collection.removeIf` is API 24; minSdk is 23.
+        val cutoff = System.currentTimeMillis() - REPLY_TARGET_TTL_MS
+        val iter = replyTargets.entries.iterator()
+        while (iter.hasNext()) {
+            val t = iter.next().value
+            if (maxOf(t.seenAt, t.dismissedAt) < cutoff) iter.remove()
+        }
+    }
+
+    /**
+     * Records [sbn]'s reply box under its conversation key and returns that
+     * key, or null when the notification is not a conversation with a
+     * free-form reply. A re-post of a known conversation REPLACES its box:
+     * the newest intent is the one the messaging app expects to be fired.
+     */
+    private fun rememberReplyTarget(sbn: StatusBarNotification): String? {
+        val notification = sbn.notification ?: return null
+        val style = NotificationCompat.MessagingStyle
+            .extractMessagingStyleFromNotification(notification) ?: return null
+        val reply = replyActionFor(notification) ?: return null
+        val key = conversationKeyFor(sbn, notification, style)
+        replyTargets[key] = ReplyTarget(sbn.key, reply.first, reply.second)
+        return key
     }
 
     override fun onCreate() {
@@ -99,14 +208,24 @@ class MessageNotificationListener : NotificationListenerService() {
 
     private lateinit var writer: DeviceTextWriter
 
+    override fun onDestroy() {
+        if (instance === this) instance = null
+        super.onDestroy()
+    }
+
     override fun onListenerConnected() {
         super.onListenerConnected()
         connected = true
+        instance = this
+        // A connect follows a process start (or a rebind after an update):
+        // the reply boxes are gone from memory and the shade still has them.
+        runCatching { rememberReplyTargetsOnShade() }
     }
 
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
         connected = false
+        instance = null
         // Android drops the binding on app update and occasionally under memory
         // pressure. Without this the service stays dead until the user toggles
         // the permission off and on again, which they will never think to do.
@@ -177,13 +296,46 @@ class MessageNotificationListener : NotificationListenerService() {
         val selfName = style.user?.name?.toString()
         val reply = replyActionFor(notification)
         val canReply = reply != null
-        // Keep the live reply box whether or not any message below is new:
-        // a re-post of an already-captured thread still refreshes the intent.
+        // Keep the reply box whether or not any message below is new: a
+        // re-post of an already-captured thread still refreshes the intent.
         if (reply != null) {
             replyTargets[conversationKey] = ReplyTarget(sbn.key, reply.first, reply.second)
         }
 
         val fresh = ArrayList<JSONObject>()
+        try {
+            collectFresh(sbn, conversationKey, isGroup, conversationTitle, selfName, canReply, messages, fresh)
+        } finally {
+            // A conversation that has just posted can be answered again. Any
+            // reply the member typed while this phone had no box for it is
+            // waiting in the outbox; send it now, AFTER the text that woke
+            // the box is filed (same single-thread executor, in order).
+            if (reply != null && writer.isConfigured()) {
+                DeviceTextWriter.executor.execute {
+                    val n = runCatching {
+                        writer.sendWaitingReplies(conversationKey) { text ->
+                            replyInline(applicationContext, conversationKey, text)
+                        }
+                    }.onFailure {
+                        android.util.Log.w("MessageNotificationListener", "waiting replies failed: ${it.message}")
+                    }.getOrDefault(0)
+                    if (n > 0) android.util.Log.i("MessageNotificationListener", "sent $n waiting repl(y/ies)")
+                }
+            }
+        }
+    }
+
+    /** The messages on [sbn] this process has not filed yet, delivered. */
+    private fun collectFresh(
+        sbn: StatusBarNotification,
+        conversationKey: String,
+        isGroup: Boolean,
+        conversationTitle: String?,
+        selfName: String?,
+        canReply: Boolean,
+        messages: List<NotificationCompat.MessagingStyle.Message>,
+        fresh: ArrayList<JSONObject>,
+    ) {
         for (message in messages) {
             val text = message.text?.toString().orEmpty()
             // A picture message posts a notification with an EMPTY text and a

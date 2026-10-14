@@ -16,11 +16,12 @@ import androidx.core.content.ContextCompat
  *
  * Two routes, tried in this order by the Dart side:
  *
- *  1. The conversation's own notification, if it is still posted —
+ *  1. The conversation's notification reply box —
  *     [MessageNotificationListener.replyInline]. That is the only way any
- *     third-party app can answer an RCS chat, and it lands in the exact
- *     thread with no number needed. It is gone the moment the member reads
- *     the thread on the phone.
+ *     third-party app can answer an RCS chat or a GROUP, and it lands in the
+ *     exact thread with no number needed. Since 2026-10-14 the box is kept
+ *     after the notification is dismissed and rebuilt from the shade after a
+ *     restart, so it is there for as long as the system keeps the intent.
  *  2. This class: `SmsManager`, plain SMS to one number under `SEND_SMS`.
  *     Reliable, SMS only. Android writes the sent row to the SMS provider
  *     itself for an app that is not the default messenger, so
@@ -29,7 +30,9 @@ import androidx.core.content.ContextCompat
  *
  * A group is NOT sent by route 2: `SmsManager` would fan it out as separate
  * 1:1 texts, which is a different conversation for everyone on it. A group
- * reply needs route 1, and the Dart side says so when it cannot.
+ * reply with no box WAITS (`status: 'waiting'`) and
+ * [DeviceTextWriter.sendWaitingReplies] sends it the moment the thread posts
+ * again — this process holds the box, so no Dart engine is needed.
  */
 internal class SmsSender(private val context: Context) {
 

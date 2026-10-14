@@ -79,11 +79,13 @@ class MessagingIngestPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 result.success(null)
             }
             "isNativeWriterConfigured" -> result.success(IngestConfig(context).isConfigured())
-            // One sent-text sync on the writer's thread, as the Dart sync
-            // would have done it; the count comes back when it is durable.
+            // One pass over the handset's store on the writer's thread, both
+            // directions (sent texts, and replies that posted no notification
+            // because their thread was open on the phone); the count comes
+            // back when it is durable. The method keeps its historical name.
             "syncSent" -> {
                 DeviceTextWriter.executor.execute {
-                    val n = runCatching { DeviceTextWriter(context).syncSent() }.getOrElse { -1 }
+                    val n = runCatching { DeviceTextWriter(context).syncStore() }.getOrElse { -1 }
                     main.post {
                         if (n < 0) result.error("sync_failed", "sent-text sync failed", null)
                         else result.success(n)

@@ -91,6 +91,17 @@ internal class DeviceTextWriter(private val context: Context) {
         private const val COL_CONVERSATION = "textConversation"
         private const val COL_MESSAGE = "message"
 
+        /** A reply typed elsewhere for this phone to send — `DeviceOutboxService`. */
+        private const val COL_OUTBOX = "deviceOutbox"
+
+        /** A group reply the Dart side could not send because this phone had
+         *  no reply box for the thread; [sendWaitingReplies] sends it when
+         *  the thread next posts. */
+        private const val STATUS_WAITING = "waiting"
+
+        /** How long a waiting reply is still the member's words. */
+        private const val WAITING_MAX_AGE_MS = 24L * 60 * 60 * 1000
+
         private const val FIELD_CAPTURE_OFF = "deviceTextCaptureOff"
         private const val FIELD_INCOMING_LIMIT = "deviceIncomingLimit"
         private const val FIELD_INCOMING_MODE = "deviceIncomingMode"
@@ -610,6 +621,187 @@ internal class DeviceTextWriter(private val context: Context) {
         return written
     }
 
+    /**
+     * One pass over the handset's store in BOTH directions — what the
+     * provider's change notification and the Dart side's sync both call.
+     * Returns how many documents were written.
+     */
+    fun syncStore(): Int {
+        val sent = runCatching { syncSent() }
+            .onFailure { Log.w(TAG, "sent sync failed: ${it.message}") }
+            .getOrDefault(0)
+        val inbox = runCatching { syncInbox() }
+            .onFailure { Log.w(TAG, "inbox sync failed: ${it.message}") }
+            .getOrDefault(0)
+        return sent + inbox
+    }
+
+    /**
+     * Texts that ARRIVED, read from the same store — see
+     * [SentMessageReader.readInbox] for why the notification listener alone
+     * is not enough: Google Messages posts nothing for the conversation that
+     * is OPEN on the phone, so a reply that came in while the member was
+     * reading that thread on the handset was lost (2026-10-13). An SMS or
+     * MMS lands in the provider whatever is on screen.
+     *
+     * Same shape as [syncSent]: its own watermark, acked only after the batch
+     * is durable; NO history on the first run; the member's Limit list,
+     * matched on the SENDER's name and number; and [ThreadDedupe], so the
+     * copy the listener filed a second earlier (when it did) is the one that
+     * survives, with this row's key folded in.
+     *
+     * Unread (`readByMemberIds` empty), like every captured inbound text
+     * since 2026-10-10: a phone notification is not a read, and neither is
+     * the provider row. A text from a SHORT CODE or an alphanumeric sender
+     * (a one-time code, a carrier notice) is never filed — not a
+     * conversation, and the listener drops the OS's redacted placeholder for
+     * the same texts on purpose.
+     *
+     * 🛑 An RCS reply to an open thread is still invisible: no store holds it.
+     */
+    fun syncInbox(): Int {
+        val reader = SentMessageReader(context)
+        if (!reader.isGranted()) return 0
+        val s = session() ?: return 0
+        if (s.captureOff) return 0
+
+        var index: ThreadIndex? = null
+        var written = 0
+        for (page in 0 until SENT_PAGES_PER_SYNC) {
+            val watermark = reader.inboxWatermark()
+            // 🛑 NO history import, and the sent watermark is not borrowed —
+            // see KEY_INBOX_WATERMARK. Only texts arriving from here on.
+            if (watermark <= 0L) {
+                reader.ackInbox(System.currentTimeMillis())
+                break
+            }
+            val rows = runCatching { reader.readInbox(watermark, SENT_PAGE_SIZE) }
+                .getOrElse { emptyList() }
+            if (rows.isEmpty()) break
+
+            val idx = index ?: ThreadIndex.load(s)?.also { index = it } ?: break
+            val batch = s.db.batch()
+            val newestPerThread = HashMap<String, InboxRow>()
+            val dedupers = HashMap<String, ThreadDedupe>()
+            val previews = HashMap<String, String>()
+            var merged = 0
+            var newest = 0L
+            var count = 0
+            for (raw in rows) {
+                // Past a row we will never file (blank, a short code, kept out
+                // by the list, a group we cannot place), so it is not re-read.
+                (raw["timestamp"] as? Long)?.let { if (it > newest) newest = it }
+                val row = InboxRow.from(raw) ?: continue
+                if (!passesInboxList(s, row)) continue
+                val threadId = idx.resolveInbox(row) ?: continue
+                val threadRef = s.company.collection(COL_CONVERSATION).document(threadId)
+                val messageDocId = DartDocId.docIdFor(row.dedupKey)
+                // The listener usually filed this very text a second ago —
+                // the same twin rule as the sent side, the other direction.
+                val dedupe = dedupers.getOrPut(threadId) { ThreadDedupe.recent(threadRef) }
+                val twin = dedupe.duplicateOf(row.dedupKey, false, row.text, row.timestamp)
+                if (twin != null) {
+                    batch.set(
+                        threadRef.collection(COL_MESSAGE).document(twin),
+                        mapOf(
+                            "deviceDedupKeyAlt" to FieldValue.arrayUnion(row.dedupKey),
+                            "deviceKind" to row.kind,
+                            "deviceSmsThreadId" to row.threadId,
+                            "deviceSender" to row.sender,
+                        ),
+                        SetOptions.merge(),
+                    )
+                    merged++
+                    continue
+                }
+                val attachments =
+                    uploadedAttachments(row.attachments, s.company.id, messageDocId)
+                val doc = HashMap<String, Any?>()
+                doc["text"] = row.text
+                doc["senderRef"] = null
+                doc["senderName"] = row.displayName
+                doc["createdAt"] = Timestamp(Date(row.timestamp))
+                doc["readByMemberIds"] = emptyList<String>()
+                doc["visibleToMemberIds"] = listOf(s.memberRef.id)
+                doc["attachments"] = attachments
+                doc["isDeleted"] = false
+                doc["source"] = "device"
+                doc["deviceKind"] = row.kind
+                doc["deviceSmsThreadId"] = row.threadId
+                doc["deviceSender"] = row.sender
+                doc["capturedAt"] = Timestamp.now()
+                doc["deviceDedupKey"] = row.dedupKey
+                doc["ingestedAt"] = FieldValue.serverTimestamp()
+                batch.set(
+                    threadRef.collection(COL_MESSAGE).document(messageDocId),
+                    doc,
+                    SetOptions.merge(),
+                )
+                count++
+                dedupe.record(messageDocId, row.dedupKey, false, row.text, row.timestamp)
+                previews[row.dedupKey] = previewText(row.text, attachments)
+                val incumbent = newestPerThread[threadId]
+                if (incumbent == null || row.timestamp > incumbent.timestamp) {
+                    newestPerThread[threadId] = row
+                }
+            }
+            if (count == 0 && merged == 0) {
+                if (newest > 0L) reader.ackInbox(newest)
+                if (rows.size < SENT_PAGE_SIZE) break else continue
+            }
+
+            try {
+                await(batch.commit())
+            } catch (e: Exception) {
+                Log.w(TAG, "inbox batch commit failed: ${e.message}")
+                // Watermark untouched: the next sync re-reads this page.
+                break
+            }
+            written += count
+
+            for ((threadId, row) in newestPerThread) {
+                advanceThread(
+                    s,
+                    threadId,
+                    // Names only a thread it had to create, like a sent text.
+                    title = if (idx.isNew(threadId)) row.displayName else null,
+                    isGroup = false,
+                    text = previews[row.dedupKey] ?: row.text,
+                    senderName = row.displayName,
+                    atMillis = row.timestamp,
+                    extra = mapOf("deviceSmsThreadId" to row.threadId),
+                )
+            }
+
+            // Only now: the batch is durable.
+            if (newest > 0L) reader.ackInbox(newest)
+            // A conversation this path had to create brings its past with it.
+            for ((threadId, row) in newestPerThread) {
+                if (!idx.isNew(threadId)) continue
+                runCatching {
+                    pullHistory(
+                        s,
+                        threadId,
+                        handsetThreadId = row.threadId,
+                        beforeMillis = row.timestamp - HISTORY_MARGIN_MS,
+                        whoForLookup = null,
+                    )
+                }.onFailure { Log.w(TAG, "history pull failed for $threadId: ${it.message}") }
+            }
+            if (rows.size < SENT_PAGE_SIZE) break
+        }
+        return written
+    }
+
+    /** The Limit list for a text that ARRIVED through the store: matched on
+     *  the sender's contact name and number, as the listener matches on the
+     *  notification's name. Mirrors [passesIncomingList]. */
+    private fun passesInboxList(s: Session, row: InboxRow): Boolean {
+        if (!s.incomingLimit) return true
+        val hit = matchesIncomingList(s.incomingPeople, listOf(row.senderName, row.sender))
+        return if (s.incomingExclude) !hit else hit
+    }
+
     // ── One conversation's history ──────────────────────────────────────────
 
     /**
@@ -807,6 +999,52 @@ internal class DeviceTextWriter(private val context: Context) {
                     threadId = (m["threadId"] as? String) ?: "",
                     addresses = addresses,
                     names = names,
+                    text = text,
+                    timestamp = (m["timestamp"] as? Long) ?: 0L,
+                    attachments = attachments,
+                )
+            }
+        }
+    }
+
+    /** One row from [SentMessageReader.readInbox], typed. Null for a row
+     *  that is not a text from a person: blank, no sender, or a short code /
+     *  alphanumeric sender id. */
+    private class InboxRow(
+        val dedupKey: String,
+        val kind: String,
+        val threadId: String,
+        val sender: String,
+        val senderName: String?,
+        /** TO addresses the MMS named beside the handset's own placeholder. */
+        val others: List<String>,
+        val text: String,
+        val timestamp: Long,
+        val attachments: List<Map<String, Any?>>,
+    ) {
+        /** The sender as the thread shows them: the contact, else the number
+         *  as the phone would print it. */
+        val displayName: String
+            get() = senderName?.trim()?.takeIf { it.isNotEmpty() } ?: nationalNumber(sender)
+
+        companion object {
+            @Suppress("UNCHECKED_CAST")
+            fun from(m: Map<String, Any?>): InboxRow? {
+                val text = (m["text"] as? String).orEmpty()
+                val attachments = (m["attachments"] as? List<*>)
+                    ?.mapNotNull { it as? Map<String, Any?> }
+                    ?: emptyList()
+                if (text.isEmpty() && attachments.isEmpty()) return null
+                val dedupKey = (m["dedupKey"] as? String)?.takeIf { it.isNotEmpty() } ?: return null
+                val sender = (m["sender"] as? String)?.trim().orEmpty()
+                if (sender.isEmpty() || looksLikeServiceSender(sender)) return null
+                return InboxRow(
+                    dedupKey = dedupKey,
+                    kind = (m["kind"] as? String) ?: "sms",
+                    threadId = (m["threadId"] as? String) ?: "",
+                    sender = sender,
+                    senderName = m["senderName"] as? String,
+                    others = (m["others"] as? List<*>)?.mapNotNull { it as? String } ?: emptyList(),
                     text = text,
                     timestamp = (m["timestamp"] as? Long) ?: 0L,
                     attachments = attachments,
@@ -1092,10 +1330,214 @@ internal class DeviceTextWriter(private val context: Context) {
             return id
         }
 
+        /**
+         * The conversation an INBOUND provider row belongs in, or null when
+         * it cannot be placed safely: the thread carrying this handset id,
+         * else the thread titled with this one sender (`partiesKey` of the
+         * contact name or the number — so a reply files into the thread the
+         * sent text made), else, for a text that names nobody else, a new
+         * `device_sms_<threadId>` titled for the sender.
+         *
+         * 🛑 An MMS that names other recipients beside us may be a GROUP —
+         * and which of those addresses is the phone's own number is not
+         * knowable here. Nothing is created for it; the notification path,
+         * which carries the group's title, is the one that files it.
+         */
+        fun resolveInbox(row: InboxRow): String? {
+            byHandsetThread[row.threadId]?.let { return it }
+            val key = partiesKey(listOf(row.displayName))
+            val byTitle = if (key.isEmpty()) null else byParties[key]
+            if (byTitle != null) {
+                byHandsetThread[row.threadId] = byTitle
+                return byTitle
+            }
+            if (row.others.isNotEmpty()) return null
+            val id = DartDocId.deviceSmsConversationId(row.threadId)
+            created.add(id)
+            if (key.isNotEmpty()) byParties[key] = id
+            byHandsetThread[row.threadId] = id
+            return id
+        }
+
         fun isNew(threadId: String): Boolean = threadId in created
     }
 
     // ── Thread preview ──────────────────────────────────────────────────────
+
+    // ── Replies that waited for a reply box ─────────────────────────────────
+
+    /**
+     * Sends every outbox row of this member that is `waiting` on
+     * [conversationKey] — a group reply typed elsewhere while this phone had
+     * no reply box for the thread — now that the conversation has posted
+     * again. [fire] is the listener's inline reply; it answers false when the
+     * box is not there after all.
+     *
+     * Runs on [executor] (Firestore is awaited); blocking. Returns how many
+     * left the phone. Mirrors the Dart `DeviceOutboxService._sendOne` for the
+     * one route the Dart side cannot take on its own: the Dart engine is not
+     * running when the notification lands, and the box lives in THIS process.
+     *
+     * - Claimed in a transaction (`waiting` → `sending`) so a Dart pass that
+     *   happens to be awake never sends the same words twice.
+     * - A row that has waited longer than [WAITING_MAX_AGE_MS] is NOT sent:
+     *   the conversation has moved on without those words, and a reply
+     *   that arrives a day late reads as a reply to whatever came since. It
+     *   fails, with that reason, and the member decides from the strip.
+     * - On `sent` the text is FILED into the thread here, keyed
+     *   `outbox|<id>` exactly as `MessageIngestService.recordOutboxSent`
+     *   files it, so the feed moves at once and the re-posted notification
+     *   folds into this document through the thread dedupe.
+     */
+    fun sendWaitingReplies(conversationKey: String, fire: (text: String) -> Boolean): Int {
+        if (conversationKey.isEmpty()) return 0
+        val s = session() ?: return 0
+        val rows = runCatching {
+            await(
+                s.company.collection(COL_OUTBOX)
+                    .whereEqualTo("memberRef", s.memberRef)
+                    .whereEqualTo("status", STATUS_WAITING)
+                    .whereEqualTo("conversationKey", conversationKey)
+                    // list-cap: 20. ONE member's replies waiting on ONE
+                    // conversation — typed between two texts of a thread;
+                    // 0 rows existed when the status was created
+                    // (2026-10-14). The next post sends the rest.
+                    .limit(20)
+                    .get(),
+            )
+        }.onFailure { Log.w(TAG, "waiting outbox read failed: ${it.message}") }
+            .getOrNull() ?: return 0
+        if (rows.isEmpty) return 0
+
+        val docs = rows.documents.sortedBy { d ->
+            (d.get("createdAt") as? Timestamp)?.toDate()?.time ?: 0L
+        }
+        var sent = 0
+        val now = System.currentTimeMillis()
+        for (d in docs) {
+            val ref = d.reference
+            val text = (d.get("text") as? String)?.trim().orEmpty()
+            val threadId = (d.get("threadId") as? String)?.trim().orEmpty()
+            val isGroup = d.get("isGroup") == true
+            val since = ((d.get("retriedAt") as? Timestamp) ?: (d.get("createdAt") as? Timestamp))
+                ?.toDate()?.time ?: now
+            // Claim it, or leave it to whoever did.
+            val claimed = runCatching {
+                await(
+                    s.db.runTransaction { tx ->
+                        val fresh = tx.get(ref)
+                        if (fresh.get("status") != STATUS_WAITING) return@runTransaction false
+                        tx.set(
+                            ref,
+                            mapOf(
+                                "status" to "sending",
+                                "claimedAt" to FieldValue.serverTimestamp(),
+                                "claimedBy" to "phone",
+                            ),
+                            SetOptions.merge(),
+                        )
+                        true
+                    },
+                )
+            }.getOrDefault(false)
+            if (!claimed) continue
+
+            fun settle(fields: Map<String, Any?>) {
+                runCatching { await(ref.set(fields, SetOptions.merge())) }
+                    .onFailure { Log.w(TAG, "outbox ${ref.id} settle failed: ${it.message}") }
+            }
+
+            if (text.isEmpty()) {
+                settle(mapOf("status" to "failed", "done" to false, "error" to "Nothing to send.",
+                    "failedAt" to FieldValue.serverTimestamp()))
+                continue
+            }
+            if (now - since > WAITING_MAX_AGE_MS) {
+                settle(
+                    mapOf(
+                        "status" to "failed",
+                        "done" to false,
+                        "error" to "The conversation came back to your phone more than a day " +
+                            "after you wrote this, so it was not sent. Retry sends it now.",
+                        "failedAt" to FieldValue.serverTimestamp(),
+                    ),
+                )
+                continue
+            }
+
+            val ok = try {
+                fire(text)
+            } catch (e: Exception) {
+                settle(
+                    mapOf(
+                        "status" to "failed",
+                        "done" to false,
+                        "error" to "Your phone could not send it: ${e.message ?: e.javaClass.simpleName}",
+                        "failedAt" to FieldValue.serverTimestamp(),
+                    ),
+                )
+                continue
+            }
+            if (!ok) {
+                // The box the post promised is not usable after all. Back to
+                // waiting: the next post brings a new one.
+                settle(mapOf("status" to STATUS_WAITING, "done" to false, "replyBox" to "gone"))
+                continue
+            }
+
+            val sentAt = Date()
+            settle(
+                mapOf(
+                    "status" to "sent",
+                    "done" to true,
+                    "route" to "inline",
+                    "replyBox" to "reposted",
+                    "sentBy" to "phone",
+                    "error" to FieldValue.delete(),
+                    "sentAt" to FieldValue.serverTimestamp(),
+                ),
+            )
+            sent++
+            if (threadId.isEmpty()) continue
+            // File it — the mirror of `recordOutboxSent`.
+            val dedupKey = "outbox|${ref.id}"
+            val threadRef = s.company.collection(COL_CONVERSATION).document(threadId)
+            val doc = HashMap<String, Any?>()
+            doc["text"] = text
+            doc["senderRef"] = s.memberRef
+            doc["senderName"] = s.memberName
+            doc["createdAt"] = Timestamp(sentAt)
+            doc["readByMemberIds"] = listOf(s.memberRef.id)
+            doc["visibleToMemberIds"] = listOf(s.memberRef.id)
+            doc["attachments"] = emptyList<Map<String, Any?>>()
+            doc["isDeleted"] = false
+            doc["source"] = "device"
+            doc["deviceOutboxId"] = ref.id
+            doc["deviceRoute"] = "inline"
+            doc["deviceDedupKey"] = dedupKey
+            doc["capturedAt"] = Timestamp(sentAt)
+            doc["ingestedAt"] = FieldValue.serverTimestamp()
+            runCatching {
+                await(
+                    threadRef.collection(COL_MESSAGE)
+                        .document(DartDocId.docIdFor(dedupKey))
+                        .set(doc, SetOptions.merge()),
+                )
+            }.onFailure { Log.w(TAG, "could not file waiting reply ${ref.id}: ${it.message}") }
+            advanceThread(
+                s,
+                threadId,
+                // A sent text never renames the thread it answers.
+                title = null,
+                isGroup = isGroup,
+                text = text,
+                senderName = s.memberName,
+                atMillis = sentAt.time,
+                extra = emptyMap(),
+            )
+        }
+        return sent
+    }
 
     /**
      * Moves a thread's preview forward to [atMillis] — never backwards —
@@ -1199,6 +1641,19 @@ internal fun matchesIncomingList(people: List<String>, names: List<String?>): Bo
         }
     }
     return false
+}
+
+/**
+ * A sender that is not a person: a short code (fewer than seven digits) or an
+ * alphanumeric sender id ("VERIZON", "Google"). What arrives from one is a
+ * one-time code or a service notice — nothing a member answers, and the
+ * listener declines the OS's redacted placeholder for the same texts.
+ */
+internal fun looksLikeServiceSender(address: String): Boolean {
+    val bare = address.filter { !it.isWhitespace() && it != '+' && it != '-' && it != '(' && it != ')' && it != '.' }
+    if (bare.isEmpty()) return true
+    if (!bare.all { it.isDigit() }) return true
+    return bare.length < 7
 }
 
 /**

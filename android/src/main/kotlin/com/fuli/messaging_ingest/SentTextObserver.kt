@@ -9,8 +9,9 @@ import android.provider.Telephony
 import android.util.Log
 
 /**
- * Watches the handset's SMS/MMS store and files what the member SENDS, with
- * no Flutter engine — the sent-side twin of [MessageNotificationListener].
+ * Watches the handset's SMS/MMS store and files what the member SENDS — and,
+ * since 2026-10-13, what ARRIVES there too — with no Flutter engine: the
+ * store-side twin of [MessageNotificationListener].
  *
  * A text typed in the messaging app posts no notification; it lands in the
  * provider. Until 2026-09-07 only the Dart side read that store, on boot or
@@ -70,10 +71,13 @@ internal object SentTextObserver {
             val r = Runnable {
                 synchronized(this) { pending = null }
                 DeviceTextWriter.executor.execute {
-                    val n = runCatching { DeviceTextWriter(app).syncSent() }
-                        .onFailure { Log.w(TAG, "sent sync failed: ${it.message}") }
+                    // Both directions since 2026-10-13: a reply that arrives
+                    // while its thread is open on the phone posts no
+                    // notification, and this store is the only place it is.
+                    val n = runCatching { DeviceTextWriter(app).syncStore() }
+                        .onFailure { Log.w(TAG, "store sync failed: ${it.message}") }
                         .getOrDefault(0)
-                    if (n > 0) Log.i(TAG, "filed $n sent text(s)")
+                    if (n > 0) Log.i(TAG, "filed $n text(s) from the store")
                 }
             }
             pending = r
