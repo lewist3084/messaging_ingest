@@ -59,15 +59,16 @@ class IngestedMessage {
   /// staleness rate is measurable before any reply path is built on it.
   final bool canReply;
 
-  /// A `content://` URI for the picture this message carried, when it carried
-  /// one. Readable ONLY inside the app's own process, and only while the
+  /// A `content://` URI for the picture (or contact card) this message
+  /// carried, when it carried one. Readable ONLY inside the app's own process, and only while the
   /// notification that granted it is posted — so it is a handle to copy from
   /// promptly, never something to store. Fetch the bytes with
   /// `MessagingIngest.readAttachmentBytes`.
   final String? attachmentUri;
 
-  /// Always an `image/*` type: the capture side drops every other kind,
-  /// because a bubble has nothing to render them with.
+  /// An `image/*` type, or a vCard type since 2026-10-15 (RCS from Google
+  /// Messages may post a shared contact as the data URI). The capture side
+  /// drops every other kind, because a bubble has nothing to render it with.
   final String? attachmentMimeType;
 
   /// A picture message has no text at all. Anything reading these must say

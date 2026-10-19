@@ -69,11 +69,13 @@ internal class SentMessageReader(private val context: Context) {
         private val MMS_PART_URI: Uri = Uri.parse("content://mms/part")
 
         /**
-         * A file extension for a captured image whose part carried no name.
+         * A file extension for a captured part whose part carried no name.
          * The chip's label is the only thing the member sees, and "photo-42"
          * with no extension reads as a file nothing can open.
          */
-        fun extensionFor(mimeType: String): String = when (mimeType.lowercase()) {
+        fun extensionFor(mimeType: String): String = when (mimeType.lowercase().substringBefore(';').trim()) {
+            "text/vcard", "text/x-vcard", "text/directory",
+            "text/x-vcalendar-contact", "application/vcard" -> ".vcf"
             "image/jpeg", "image/jpg" -> ".jpg"
             "image/png" -> ".png"
             "image/gif" -> ".gif"
@@ -214,6 +216,8 @@ internal class SentMessageReader(private val context: Context) {
                 Telephony.Mms.Part.CONTENT_TYPE,
                 Telephony.Mms.Part.TEXT,
                 Telephony.Mms.Part._DATA,
+                Telephony.Mms.Part.NAME,
+                Telephony.Mms.Part.FILENAME,
             ),
             "${Telephony.Mms.Part.MSG_ID} = ?",
             arrayOf(id.toString()),
@@ -223,8 +227,18 @@ internal class SentMessageReader(private val context: Context) {
             val iCt = c.getColumnIndexOrThrow(Telephony.Mms.Part.CONTENT_TYPE)
             val iText = c.getColumnIndexOrThrow(Telephony.Mms.Part.TEXT)
             val iData = c.getColumnIndexOrThrow(Telephony.Mms.Part._DATA)
+            val iName = c.getColumnIndexOrThrow(Telephony.Mms.Part.NAME)
+            val iFile = c.getColumnIndexOrThrow(Telephony.Mms.Part.FILENAME)
             while (c.moveToNext()) {
                 if (c.getString(iCt) != "text/plain") continue
+                // A vCard is never a caption (2026-10-15). Its part is
+                // `text/x-vcard` and fails the line above — but a gateway
+                // that restamps it `text/plain` keeps the `.vcf` name, and
+                // reading it here would file BEGIN:VCARD… as the text while
+                // [mmsAttachments] files the same part as the card.
+                if (VCardParser.isVCardMime(null, c.getString(iFile)) ||
+                    VCardParser.isVCardMime(null, c.getString(iName))
+                ) continue
                 val inline = c.getString(iText)
                 val text = if (!c.isNull(iData) && inline.isNullOrEmpty()) {
                     // A long text part is spilled to a file the provider serves
@@ -245,12 +259,15 @@ internal class SentMessageReader(private val context: Context) {
     }
 
     /**
-     * The IMAGE parts of one MMS, as handles the writer can fetch bytes for.
+     * The IMAGE and CONTACT-CARD parts of one MMS, as handles the writer can
+     * fetch bytes for.
      *
-     * Images only, deliberately. A picture is what a text message actually
-     * carries; the SMIL layout part is markup, and a vCard or an audio clip
-     * would each need their own rendering before uploading one was worth the
-     * bytes. Everything skipped here is skipped visibly — see the caller.
+     * Pictures and vCards, deliberately. A picture is what a text message
+     * usually carries; the SMIL layout part is markup, and an audio clip
+     * would need its own rendering before uploading one was worth the bytes.
+     * Until 2026-10-15 the vCard was skipped too, and a shared contact
+     * reached the thread as "Contact card" with nothing behind it — the
+     * writer now parses it into the `contact` attachment ([VCardParser]).
      *
      * The part is NOT read here. A provider read plus a Storage upload per
      * message, on the thread walking a backlog, is exactly the work that must
@@ -267,32 +284,49 @@ internal class SentMessageReader(private val context: Context) {
                 Telephony.Mms.Part.CONTENT_TYPE,
                 Telephony.Mms.Part.NAME,
                 Telephony.Mms.Part.FILENAME,
+                Telephony.Mms.Part.TEXT,
             ),
             "${Telephony.Mms.Part.MSG_ID} = ?",
             arrayOf(id.toString()),
             null,
         )?.use { c ->
             val iPart = c.getColumnIndexOrThrow(Telephony.Mms.Part._ID)
+            val iText = c.getColumnIndexOrThrow(Telephony.Mms.Part.TEXT)
             val iCt = c.getColumnIndexOrThrow(Telephony.Mms.Part.CONTENT_TYPE)
             val iName = c.getColumnIndexOrThrow(Telephony.Mms.Part.NAME)
             val iFile = c.getColumnIndexOrThrow(Telephony.Mms.Part.FILENAME)
             while (c.moveToNext()) {
                 val contentType = c.getString(iCt)?.trim().orEmpty().lowercase()
-                if (!contentType.startsWith("image/")) continue
                 val partId = c.getLong(iPart)
                 // The provider fills one of these, neither, or both, depending
                 // on the sending client. A name the member recognises is nice;
                 // a name at all is required, because it is the chip's label.
                 val named = c.getString(iFile)?.trim().takeUnless { it.isNullOrEmpty() }
                     ?: c.getString(iName)?.trim().takeUnless { it.isNullOrEmpty() }
+                val isCard = VCardParser.isVCardMime(contentType, named)
+                if (!isCard && !contentType.startsWith("image/")) continue
+                // A card stamped `application/octet-stream` with a `.vcf`
+                // name goes on as a vCard, so the writer's own check agrees.
+                val mime = if (isCard && !VCardParser.isVCardMime(contentType)) {
+                    "text/x-vcard"
+                } else {
+                    contentType
+                }
+                val fallback = if (isCard) "contact-$partId.vcf" else "photo-$partId${extensionFor(contentType)}"
                 out.add(
                     hashMapOf(
                         "uri" to Uri.withAppendedPath(
                             MMS_PART_URI,
                             partId.toString(),
                         ).toString(),
-                        "mimeType" to contentType,
-                        "fileName" to (named ?: "photo-$partId${extensionFor(contentType)}"),
+                        "mimeType" to mime,
+                        "fileName" to (named ?: fallback),
+                        // The provider keeps a text/plain (or SMIL / HTML)
+                        // part in its `text` column with NO file behind the
+                        // part URI. A card a gateway restamped `text/plain`
+                        // lands there, so the writer falls back to this when
+                        // the part URI reads nothing (2026-10-15).
+                        "inlineText" to (if (isCard) c.getString(iText)?.takeIf { it.isNotBlank() } else null),
                     )
                 )
             }

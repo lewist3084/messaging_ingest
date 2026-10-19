@@ -8,7 +8,8 @@ import java.io.ByteArrayOutputStream
 import java.util.concurrent.TimeUnit
 
 /**
- * Puts a captured picture somewhere the member's BROWSER can load it.
+ * Puts a captured picture (or, since 2026-10-15, a contact card's raw
+ * `.vcf`) somewhere the member's BROWSER can load it.
  *
  * A text message's picture lives in one of two places on the handset and
  * neither is reachable from anywhere else: an MMS part
@@ -44,6 +45,14 @@ internal class AttachmentUploader(private val context: Context) {
         /** Refuse to buffer more than this into memory for one picture. */
         const val MAX_BYTES = 12 * 1024 * 1024
 
+        /**
+         * A contact card's ceiling (2026-10-15). The text of a card is a few
+         * hundred bytes; an iPhone's carries the contact's PHOTO as base64,
+         * tens of KB and occasionally a few hundred. Past this it is not a
+         * card a member shared, and it is not worth parsing in memory.
+         */
+        const val VCARD_MAX_BYTES = 2 * 1024 * 1024
+
         /** One upload's budget. Past it the message is deferred, not dropped. */
         private const val UPLOAD_TIMEOUT_S = 45L
 
@@ -72,6 +81,20 @@ internal class AttachmentUploader(private val context: Context) {
         messageDocId: String,
     ): String? {
         val bytes = readBytes(uri) ?: return null
+        return uploadBytes(bytes, mimeType, fileName, companyId, messageDocId)
+    }
+
+    /**
+     * Uploads bytes the caller has already read — a contact card, which the
+     * writer reads first to parse (2026-10-15) and then files as-is.
+     */
+    fun uploadBytes(
+        bytes: ByteArray,
+        mimeType: String,
+        fileName: String,
+        companyId: String,
+        messageDocId: String,
+    ): String? {
         return try {
             val safeName = sanitize(fileName)
             val ref = FirebaseStorage.getInstance()

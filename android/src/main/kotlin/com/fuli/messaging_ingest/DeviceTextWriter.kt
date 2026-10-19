@@ -103,9 +103,6 @@ internal class DeviceTextWriter(private val context: Context) {
         private const val WAITING_MAX_AGE_MS = 24L * 60 * 60 * 1000
 
         private const val FIELD_CAPTURE_OFF = "deviceTextCaptureOff"
-        private const val FIELD_INCOMING_LIMIT = "deviceIncomingLimit"
-        private const val FIELD_INCOMING_MODE = "deviceIncomingMode"
-        private const val FIELD_INCOMING_PEOPLE = "deviceIncomingPeople"
 
         /** A batch commit is durable locally as soon as it is enqueued; this
          *  is how long we wait for the SERVER before moving on. */
@@ -140,10 +137,13 @@ internal class DeviceTextWriter(private val context: Context) {
         val memberName: String,
         val packages: Set<String>,
         val captureOff: Boolean,
-        val incomingLimit: Boolean,
-        val incomingExclude: Boolean,
-        val incomingPeople: List<String>,
-    )
+        /** [DirectoryCapture.EVERYONE] or [DirectoryCapture.DIRECTORY]. */
+        val incomingScope: String,
+    ) {
+        /** The directory, asked once per party — [DirectoryCapture] caches
+         *  across sessions, so this is only the handle. */
+        val directory: DirectoryCapture get() = DirectoryCapture(company)
+    }
 
     /** The outcome of handing a capture to the phone's own writer. */
     enum class Outcome {
@@ -190,11 +190,7 @@ internal class DeviceTextWriter(private val context: Context) {
             memberName = name,
             packages = cfg.packages,
             captureOff = data[FIELD_CAPTURE_OFF] == true,
-            incomingLimit = data[FIELD_INCOMING_LIMIT] == true,
-            incomingExclude = data[FIELD_INCOMING_MODE] == "exclude",
-            incomingPeople = (data[FIELD_INCOMING_PEOPLE] as? List<*>)
-                ?.filterIsInstance<String>()
-                .orEmpty(),
+            incomingScope = DirectoryCapture.scopeOf(data),
         )
     }
 
@@ -280,8 +276,14 @@ internal class DeviceTextWriter(private val context: Context) {
         for (m in payloads) {
             val packageName = m.optString("packageName")
             if (packageName !in s.packages) continue
-            // Not on the member's "Limit who comes in" list: dropped, final.
-            if (!passesIncomingList(s, m)) continue
+            // Outside the member's scope (not in the directory): dropped,
+            // final. Undecidable (the directory could not be asked): the
+            // whole payload is deferred to the Dart drain, nothing guessed.
+            when (inScope(s, notificationParties(m))) {
+                null -> return Outcome.DEFER
+                false -> continue
+                true -> {}
+            }
             val conversationKey = m.optString("conversationKey")
             val dedupKey = m.optString("dedupKey")
             if (conversationKey.isEmpty() || dedupKey.isEmpty()) continue
@@ -304,45 +306,48 @@ internal class DeviceTextWriter(private val context: Context) {
             val dedupe = dedupers.getOrPut(threadId) {
                 ThreadDedupe.recent(threadRef)
             }
-            val twin = dedupe.duplicateOf(dedupKey, fromMe, text, timestamp)
+            // A picture (or a contact card) arrives as a notification data
+            // URI beside an empty text. The grant on it dies with the
+            // notification, so it is copied to Storage below — there is no
+            // later. Named BEFORE the twin check, because a card may be the
+            // one thing the twin is missing.
+            val attachmentUri = m.optStringOrNull("attachmentUri").orEmpty()
+            val attachmentMime = m.optStringOrNull("attachmentMime").orEmpty()
+            val stem = if (VCardParser.isVCardMime(attachmentMime)) "contact" else "photo"
+            val parts: List<Map<String, Any?>> = if (attachmentUri.isEmpty()) emptyList() else listOf(
+                mapOf(
+                    "uri" to attachmentUri,
+                    "mimeType" to attachmentMime,
+                    "fileName" to "$stem-$timestamp" +
+                        SentMessageReader.extensionFor(attachmentMime),
+                )
+            )
+            val twin = dedupe.duplicateOf(dedupKey, fromMe, text, timestamp, partsCarryCard(parts))
             if (twin != null) {
+                val fold = HashMap<String, Any?>()
+                // So the next sweep matches on the KEY and never has to
+                // guess from text and time again.
+                fold["deviceDedupKeyAlt"] = FieldValue.arrayUnion(dedupKey)
+                fold["devicePackageName"] = packageName
+                // The one thing only this path knows: whether the
+                // notification can still be replied to.
+                fold["canReply"] = m.optBoolean("canReply", false)
+                fold.putAll(cardUpgrade(dedupe, twin, parts, s.company.id))
                 batch.set(
                     threadRef.collection(COL_MESSAGE).document(twin),
-                    mapOf(
-                        // So the next sweep matches on the KEY and never has
-                        // to guess from text and time again.
-                        "deviceDedupKeyAlt" to FieldValue.arrayUnion(dedupKey),
-                        "devicePackageName" to packageName,
-                        // The one thing only this path knows: whether the
-                        // notification can still be replied to.
-                        "canReply" to m.optBoolean("canReply", false),
-                    ),
+                    fold,
                     SetOptions.merge(),
                 )
                 merged++
                 continue
             }
-            // A picture arrives as a notification data URI beside an empty
-            // text. The grant on it dies with the notification, so it is
-            // copied to Storage HERE — there is no later.
-            val attachmentUri = m.optStringOrNull("attachmentUri").orEmpty()
-            val attachments = if (attachmentUri.isEmpty()) emptyList() else uploadedAttachments(
-                listOf(
-                    mapOf(
-                        "uri" to attachmentUri,
-                        "mimeType" to m.optStringOrNull("attachmentMime").orEmpty(),
-                        "fileName" to "photo-$timestamp" +
-                            SentMessageReader.extensionFor(
-                                m.optStringOrNull("attachmentMime").orEmpty(),
-                            ),
-                    )
-                ),
-                s.company.id,
-                messageDocId,
-            )
+            val attachments = uploadedAttachments(parts, s.company.id, messageDocId)
+            // "Contact card" beside the card itself is the sender's stand-in,
+            // not a caption (2026-10-15): the bubble is the card alone.
+            val filedText = textBeside(text, attachments)
 
             val doc = HashMap<String, Any?>()
-            doc["text"] = text
+            doc["text"] = filedText
             doc["senderRef"] = if (fromMe) s.memberRef else null
             doc["senderName"] = if (fromMe) s.memberName else (senderName ?: "Unknown")
             // The time it was SENT, not the time it reached Firestore.
@@ -366,8 +371,8 @@ internal class DeviceTextWriter(private val context: Context) {
                 SetOptions.merge(),
             )
             count++
-            dedupe.record(messageDocId, dedupKey, fromMe, text, timestamp)
-            previews[dedupKey] = previewText(text, attachments)
+            dedupe.record(messageDocId, dedupKey, fromMe, filedText, timestamp, attachmentsCarryCard(attachments))
+            previews[dedupKey] = previewText(filedText, attachments)
 
             val incumbent = newestPerThread[threadId]
             if (incumbent == null || timestamp > incumbent.optLong("timestamp", 0L)) {
@@ -431,23 +436,33 @@ internal class DeviceTextWriter(private val context: Context) {
      * it has one, else the other party. Blank counts as absent, and so does
      * our own name — an outgoing message names nobody.
      */
-    /** Mirrors `MessageIngestService._passesIncomingList` — keep them equal. */
-    private fun passesIncomingList(s: Session, m: JSONObject): Boolean {
-        if (!s.incomingLimit) return true
-        val hit = matchesIncomingList(
-            s.incomingPeople,
-            listOf(threadTitle(m), m.optStringOrNull("senderName")),
-        )
-        return if (s.incomingExclude) !hit else hit
+    /**
+     * Whether a capture with these PARTIES comes in under the member's scope
+     * (`deviceIncomingScope`): true / false, or NULL when the directory could
+     * not be asked — the caller then leaves the capture where it is (defers
+     * the payload, or stops the page before its watermark) rather than
+     * dropping or admitting it on a guess. Everyone ⇒ true, no read.
+     *
+     * Mirrors `MessageIngestService._inScope` — keep them equal.
+     */
+    private fun inScope(s: Session, parties: List<String?>): Boolean? {
+        if (s.incomingScope != DirectoryCapture.DIRECTORY) return true
+        return try {
+            s.directory.knowsAny(parties) { name -> SmsSender(context).resolveNumber(name) }
+        } catch (e: Exception) {
+            Log.w(TAG, "directory lookup failed: ${e.message}")
+            null
+        }
     }
 
-    /** The same list for a text the member SENT: it belongs to whoever it went
-     *  to, matched on the recipients' contact names and numbers. A group is a
-     *  hit when anyone in it is on the list. Mirrors `_passesSentList` in Dart. */
-    private fun passesSentList(s: Session, row: SentRow): Boolean {
-        if (!s.incomingLimit) return true
-        val hit = matchesIncomingList(s.incomingPeople, row.names + row.addresses)
-        return if (s.incomingExclude) !hit else hit
+    /** The parties to a captured NOTIFICATION: the sender, and whoever the
+     *  handset titled the conversation with (a group's names, comma-separated).
+     *  Mirrors `_notificationParties` in Dart. */
+    private fun notificationParties(m: JSONObject): List<String?> {
+        val out = ArrayList<String?>()
+        out.add(m.optStringOrNull("senderName"))
+        m.optStringOrNull("conversationTitle")?.split(',')?.let { out.addAll(it) }
+        return out
     }
 
     private fun threadTitle(m: JSONObject): String? {
@@ -501,11 +516,18 @@ internal class DeviceTextWriter(private val context: Context) {
             val previews = HashMap<String, String>()
             var newest = 0L
             var count = 0
+            // The directory could not be asked about a row: this page is
+            // neither committed nor acked, and the next sync re-reads it.
+            var undecided = false
             for (raw in rows) {
                 val row = SentRow.from(raw) ?: continue
-                // Past a text the list keeps out, so it is not re-read forever.
+                // Past a text the scope keeps out, so it is not re-read forever.
                 if (row.timestamp > newest) newest = row.timestamp
-                if (!passesSentList(s, row)) continue
+                when (inScope(s, row.names + row.addresses)) {
+                    null -> { undecided = true; break }
+                    false -> continue
+                    true -> {}
+                }
                 val threadId = idx.resolve(row)
                 val threadRef = s.company.collection(COL_CONVERSATION).document(threadId)
                 val messageDocId = DartDocId.docIdFor(row.dedupKey)
@@ -514,18 +536,22 @@ internal class DeviceTextWriter(private val context: Context) {
                 val dedupe = dedupers.getOrPut(threadId) {
                     ThreadDedupe.recent(threadRef)
                 }
-                val twin = dedupe.duplicateOf(row.dedupKey, true, row.text, row.timestamp)
+                val twin = dedupe.duplicateOf(
+                    row.dedupKey, true, row.text, row.timestamp, partsCarryCard(row.attachments),
+                )
                 if (twin != null) {
+                    val fold = HashMap<String, Any?>()
+                    fold["deviceDedupKeyAlt"] = FieldValue.arrayUnion(row.dedupKey)
+                    // What only the provider knows: which handset thread
+                    // this is, the numbers it went to — and the contact card
+                    // a notification copy could not carry.
+                    fold["deviceKind"] = row.kind
+                    fold["deviceSmsThreadId"] = row.threadId
+                    fold["deviceRecipients"] = row.addresses
+                    fold.putAll(cardUpgrade(dedupe, twin, row.attachments, s.company.id))
                     batch.set(
                         threadRef.collection(COL_MESSAGE).document(twin),
-                        mapOf(
-                            "deviceDedupKeyAlt" to FieldValue.arrayUnion(row.dedupKey),
-                            // What only the provider knows: which handset
-                            // thread this is, and the numbers it went to.
-                            "deviceKind" to row.kind,
-                            "deviceSmsThreadId" to row.threadId,
-                            "deviceRecipients" to row.addresses,
-                        ),
+                        fold,
                         SetOptions.merge(),
                     )
                     merged++
@@ -533,8 +559,9 @@ internal class DeviceTextWriter(private val context: Context) {
                 }
                 val attachments =
                     uploadedAttachments(row.attachments, s.company.id, messageDocId)
+                val filedText = textBeside(row.text, attachments)
                 val doc = HashMap<String, Any?>()
-                doc["text"] = row.text
+                doc["text"] = filedText
                 doc["senderRef"] = s.memberRef
                 doc["senderName"] = s.memberName
                 doc["createdAt"] = Timestamp(Date(row.timestamp))
@@ -555,8 +582,11 @@ internal class DeviceTextWriter(private val context: Context) {
                     SetOptions.merge(),
                 )
                 count++
-                dedupe.record(messageDocId, row.dedupKey, true, row.text, row.timestamp)
-                previews[row.dedupKey] = previewText(row.text, attachments)
+                dedupe.record(
+                    messageDocId, row.dedupKey, true, filedText, row.timestamp,
+                    attachmentsCarryCard(attachments),
+                )
+                previews[row.dedupKey] = previewText(filedText, attachments)
                 val incumbent = newestPerThread[threadId]
                 if (incumbent == null || row.timestamp > incumbent.timestamp) {
                     newestPerThread[threadId] = row
@@ -567,6 +597,7 @@ internal class DeviceTextWriter(private val context: Context) {
                 }
                 if (row.timestamp > newest) newest = row.timestamp
             }
+            if (undecided) break
             if (count == 0 && merged == 0) {
                 // Nothing usable on this page (blank texts, no recipients);
                 // move the watermark past it or the same page returns forever.
@@ -687,28 +718,41 @@ internal class DeviceTextWriter(private val context: Context) {
             var merged = 0
             var newest = 0L
             var count = 0
+            // See syncSent: an undecidable row stops the page before its ack.
+            var undecided = false
             for (raw in rows) {
                 // Past a row we will never file (blank, a short code, kept out
-                // by the list, a group we cannot place), so it is not re-read.
+                // by the scope, a group we cannot place), so it is not re-read.
                 (raw["timestamp"] as? Long)?.let { if (it > newest) newest = it }
                 val row = InboxRow.from(raw) ?: continue
-                if (!passesInboxList(s, row)) continue
+                // The sender, by contact name and by number — the store path's
+                // half of what the listener matches on the notification.
+                when (inScope(s, listOf(row.senderName, row.sender))) {
+                    null -> { undecided = true; break }
+                    false -> continue
+                    true -> {}
+                }
                 val threadId = idx.resolveInbox(row) ?: continue
                 val threadRef = s.company.collection(COL_CONVERSATION).document(threadId)
                 val messageDocId = DartDocId.docIdFor(row.dedupKey)
                 // The listener usually filed this very text a second ago —
                 // the same twin rule as the sent side, the other direction.
                 val dedupe = dedupers.getOrPut(threadId) { ThreadDedupe.recent(threadRef) }
-                val twin = dedupe.duplicateOf(row.dedupKey, false, row.text, row.timestamp)
+                val twin = dedupe.duplicateOf(
+                    row.dedupKey, false, row.text, row.timestamp, partsCarryCard(row.attachments),
+                )
                 if (twin != null) {
+                    val fold = HashMap<String, Any?>()
+                    fold["deviceDedupKeyAlt"] = FieldValue.arrayUnion(row.dedupKey)
+                    fold["deviceKind"] = row.kind
+                    fold["deviceSmsThreadId"] = row.threadId
+                    fold["deviceSender"] = row.sender
+                    // The 2026-10-14 case: the notification filed "Contact
+                    // card" with no data URI, and this MMS row IS the card.
+                    fold.putAll(cardUpgrade(dedupe, twin, row.attachments, s.company.id))
                     batch.set(
                         threadRef.collection(COL_MESSAGE).document(twin),
-                        mapOf(
-                            "deviceDedupKeyAlt" to FieldValue.arrayUnion(row.dedupKey),
-                            "deviceKind" to row.kind,
-                            "deviceSmsThreadId" to row.threadId,
-                            "deviceSender" to row.sender,
-                        ),
+                        fold,
                         SetOptions.merge(),
                     )
                     merged++
@@ -716,8 +760,9 @@ internal class DeviceTextWriter(private val context: Context) {
                 }
                 val attachments =
                     uploadedAttachments(row.attachments, s.company.id, messageDocId)
+                val filedText = textBeside(row.text, attachments)
                 val doc = HashMap<String, Any?>()
-                doc["text"] = row.text
+                doc["text"] = filedText
                 doc["senderRef"] = null
                 doc["senderName"] = row.displayName
                 doc["createdAt"] = Timestamp(Date(row.timestamp))
@@ -738,13 +783,17 @@ internal class DeviceTextWriter(private val context: Context) {
                     SetOptions.merge(),
                 )
                 count++
-                dedupe.record(messageDocId, row.dedupKey, false, row.text, row.timestamp)
-                previews[row.dedupKey] = previewText(row.text, attachments)
+                dedupe.record(
+                    messageDocId, row.dedupKey, false, filedText, row.timestamp,
+                    attachmentsCarryCard(attachments),
+                )
+                previews[row.dedupKey] = previewText(filedText, attachments)
                 val incumbent = newestPerThread[threadId]
                 if (incumbent == null || row.timestamp > incumbent.timestamp) {
                     newestPerThread[threadId] = row
                 }
             }
+            if (undecided) break
             if (count == 0 && merged == 0) {
                 if (newest > 0L) reader.ackInbox(newest)
                 if (rows.size < SENT_PAGE_SIZE) break else continue
@@ -791,15 +840,6 @@ internal class DeviceTextWriter(private val context: Context) {
             if (rows.size < SENT_PAGE_SIZE) break
         }
         return written
-    }
-
-    /** The Limit list for a text that ARRIVED through the store: matched on
-     *  the sender's contact name and number, as the listener matches on the
-     *  notification's name. Mirrors [passesIncomingList]. */
-    private fun passesInboxList(s: Session, row: InboxRow): Boolean {
-        if (!s.incomingLimit) return true
-        val hit = matchesIncomingList(s.incomingPeople, listOf(row.senderName, row.sender))
-        return if (s.incomingExclude) !hit else hit
     }
 
     // ── One conversation's history ──────────────────────────────────────────
@@ -868,7 +908,7 @@ internal class DeviceTextWriter(private val context: Context) {
             val outgoing = raw["outgoing"] == true
             val messageDocId = DartDocId.docIdFor(dedupKey)
             val historyMillis = (raw["timestamp"] as? Long) ?: 0L
-            val twin = dedupe.duplicateOf(dedupKey, outgoing, text, historyMillis)
+            val twin = dedupe.duplicateOf(dedupKey, outgoing, text, historyMillis, partsCarryCard(parts))
             if (twin != null) {
                 // Built rather than literal: a merge-set writes an explicit
                 // null, so handing it `raw["kind"]` when the sweep did not
@@ -878,6 +918,7 @@ internal class DeviceTextWriter(private val context: Context) {
                 (raw["kind"] as? String)?.takeIf { it.isNotEmpty() }
                     ?.let { fold["deviceKind"] = it }
                 fold["deviceSmsThreadId"] = handsetId.toString()
+                fold.putAll(cardUpgrade(dedupe, twin, parts, s.company.id))
                 batch.set(
                     threadRef.collection(COL_MESSAGE).document(twin),
                     fold,
@@ -891,15 +932,17 @@ internal class DeviceTextWriter(private val context: Context) {
                 continue
             }
             val sender = raw["sender"] as? String
+            val attachments = uploadedAttachments(parts, s.company.id, messageDocId)
+            val filedText = textBeside(text, attachments)
             val doc = HashMap<String, Any?>()
-            doc["text"] = text
+            doc["text"] = filedText
             doc["senderRef"] = if (outgoing) s.memberRef else null
             doc["senderName"] = if (outgoing) s.memberName
             else (raw["senderName"] as? String) ?: sender?.let { nationalNumber(it) } ?: "Unknown"
             doc["createdAt"] = Timestamp(Date((raw["timestamp"] as? Long) ?: 0L))
             doc["readByMemberIds"] = listOf(s.memberRef.id)
             doc["visibleToMemberIds"] = listOf(s.memberRef.id)
-            doc["attachments"] = uploadedAttachments(parts, s.company.id, messageDocId)
+            doc["attachments"] = attachments
             doc["isDeleted"] = false
             doc["source"] = "device"
             doc["deviceKind"] = raw["kind"]
@@ -918,8 +961,9 @@ internal class DeviceTextWriter(private val context: Context) {
                 messageDocId,
                 dedupKey,
                 outgoing,
-                text,
+                filedText,
                 historyMillis,
+                attachmentsCarryCard(attachments),
             )
             // Under Firestore's 500-write batch ceiling.
             if (++inBatch >= 400) {
@@ -1057,7 +1101,8 @@ internal class DeviceTextWriter(private val context: Context) {
      * Copies each captured picture to Storage and returns the `attachments`
      * value for the message document — the shape `TextMessageAttachment`
      * reads, so a captured photo renders in the bubble exactly like one sent
-     * from the app.
+     * from the app. A vCard part goes through [uploadedCard] instead
+     * (2026-10-15) and may yield several attachments, one per card.
      *
      * A picture that cannot be read or uploaded is DROPPED, not deferred. Both
      * sources are perishable — a notification's URI grant dies with the
@@ -1076,6 +1121,10 @@ internal class DeviceTextWriter(private val context: Context) {
         val out = ArrayList<Map<String, Any?>>(parts.size)
         for (part in parts) {
             val uri = (part["uri"] as? String)?.takeIf { it.isNotEmpty() } ?: continue
+            if (VCardParser.isVCardMime(part["mimeType"] as? String, part["fileName"] as? String)) {
+                out.addAll(uploadedCard(uploader, part, uri, companyId, messageDocId))
+                continue
+            }
             val mimeType = (part["mimeType"] as? String).orEmpty().ifBlank { "image/jpeg" }
             val fileName = (part["fileName"] as? String).orEmpty().ifBlank { "photo" }
             val url = uploader.upload(
@@ -1090,9 +1139,9 @@ internal class DeviceTextWriter(private val context: Context) {
                     "url" to url,
                     "fileName" to fileName,
                     "mimeType" to mimeType,
-                    // Images only reach here — SentMessageReader and the
-                    // listener both filter on `image/` — so the bubble always
-                    // has something to render inline.
+                    // Only images reach here — SentMessageReader and the
+                    // listener filter on `image/`, and a vCard took the
+                    // branch above — so the bubble has something to render.
                     "type" to "image",
                 )
             )
@@ -1101,15 +1150,123 @@ internal class DeviceTextWriter(private val context: Context) {
     }
 
     /**
+     * A texted CONTACT CARD (2026-10-15): read, parsed with [VCardParser],
+     * and the raw `.vcf` uploaded as-is. One `type: 'contact'` attachment
+     * per card in the file, all pointing at the same upload — the shape
+     * `TextMessageAttachment.contact` reads. A file that parses to nothing
+     * is still filed, as a `document`, so the member can at least open it.
+     * Unreadable or past [AttachmentUploader.VCARD_MAX_BYTES]: dropped, like
+     * a picture, and for the same reason (the source is perishable).
+     */
+    private fun uploadedCard(
+        uploader: AttachmentUploader,
+        part: Map<String, Any?>,
+        uri: String,
+        companyId: String,
+        messageDocId: String,
+    ): List<Map<String, Any?>> {
+        // A part held in the provider's `text` column has no file behind its
+        // URI — SentMessageReader hands its text over as `inlineText`.
+        val bytes = uploader.readBytes(uri, AttachmentUploader.VCARD_MAX_BYTES)
+            ?: (part["inlineText"] as? String)?.takeIf { it.isNotBlank() }?.toByteArray(Charsets.UTF_8)
+            ?: return emptyList()
+        val partMime = (part["mimeType"] as? String).orEmpty().trim()
+        val mimeType = if (VCardParser.isVCardMime(partMime)) partMime else "text/vcard"
+        val named = (part["fileName"] as? String).orEmpty().trim().ifBlank { "contact.vcf" }
+        val fileName = if (named.lowercase().endsWith(".vcf")) named else "$named.vcf"
+        val cards = runCatching { VCardParser.parse(VCardParser.decode(bytes)) }
+            .onFailure { Log.w(TAG, "vCard $fileName did not parse: ${it.message}") }
+            .getOrDefault(emptyList())
+        val url = uploader.uploadBytes(
+            bytes = bytes,
+            mimeType = "text/vcard",
+            fileName = fileName,
+            companyId = companyId,
+            messageDocId = messageDocId,
+        ) ?: return emptyList()
+        if (cards.isEmpty()) {
+            return listOf(
+                hashMapOf(
+                    "url" to url,
+                    "fileName" to fileName,
+                    "mimeType" to mimeType,
+                    "type" to "document",
+                )
+            )
+        }
+        return cards.map { card ->
+            hashMapOf<String, Any?>(
+                "url" to url,
+                "fileName" to fileName,
+                "mimeType" to mimeType,
+                "type" to "contact",
+                "contact" to card,
+            )
+        }
+    }
+
+    /** Whether capture handles (before upload) include a vCard part. */
+    private fun partsCarryCard(parts: List<Map<String, Any?>>): Boolean = parts.any {
+        VCardParser.isVCardMime(it["mimeType"] as? String, it["fileName"] as? String)
+    }
+
+    /** Whether uploaded attachments include a parsed card. */
+    private fun attachmentsCarryCard(attachments: List<Map<String, Any?>>): Boolean =
+        attachments.any { it["type"] == "contact" }
+
+    /**
+     * The text to file beside [attachments]. A sender's "Contact card"
+     * placeholder next to the parsed card is dropped (2026-10-15), so the
+     * bubble is the card alone; next to a card that did NOT parse it stays,
+     * because then it is the only thing saying what the file is.
+     */
+    private fun textBeside(text: String, attachments: List<Map<String, Any?>>): String =
+        if (attachmentsCarryCard(attachments) && VCardParser.isPlaceholderText(text)) "" else text
+
+    /**
+     * Merge fields that hand a twin captured WITHOUT its card the card this
+     * copy carries (2026-10-15). The notification can post "Contact card"
+     * with no data URI; the provider reads the same MMS seconds later WITH
+     * the vCard. [ThreadDedupe] pairs them, and folding only the alt key
+     * would keep the copy that has nothing behind its words. So the card is
+     * uploaded under the TWIN's id and written onto it, and its placeholder
+     * text cleared. Empty when there is nothing to add.
+     */
+    private fun cardUpgrade(
+        dedupe: ThreadDedupe,
+        twin: String,
+        parts: List<Map<String, Any?>>,
+        companyId: String,
+    ): Map<String, Any?> {
+        if (!partsCarryCard(parts) || dedupe.carriesCard(twin)) return emptyMap()
+        val attachments = uploadedAttachments(parts, companyId, twin)
+        if (!attachmentsCarryCard(attachments)) return emptyMap()
+        val out = HashMap<String, Any?>()
+        out["attachments"] = attachments
+        if (dedupe.placeholderOnly(twin)) out["text"] = ""
+        dedupe.markCard(twin)
+        return out
+    }
+
+    /**
      * What a thread's preview line says for this message. A picture message
      * has no text, and a thread whose newest row is blank reads as an empty
      * conversation in the list — the same silence the picture itself used to
-     * arrive in.
+     * arrive in. A contact card reads `👤 <name>` (2026-10-15).
      */
-    private fun previewText(text: String, attachments: List<Map<String, Any?>>): String =
-        if (text.isNotBlank() || attachments.isEmpty()) text
-        else if (attachments.size == 1) "📷 Photo"
-        else "📷 ${attachments.size} photos"
+    private fun previewText(text: String, attachments: List<Map<String, Any?>>): String {
+        if (text.isNotBlank() || attachments.isEmpty()) return text
+        val cards = attachments.filter { it["type"] == "contact" }
+        if (cards.isNotEmpty()) {
+            if (cards.size > 1) return "👤 ${cards.size} contacts"
+            @Suppress("UNCHECKED_CAST")
+            val name = (cards.first()["contact"] as? Map<String, Any>)
+                ?.let { VCardParser.nameOf(it).trim() }
+                .orEmpty()
+            return if (name.isEmpty()) "👤 Contact" else "👤 $name"
+        }
+        return if (attachments.size == 1) "📷 Photo" else "📷 ${attachments.size} photos"
+    }
 
     /** The member's device threads, indexed for filing texts in EITHER
      *  direction. Mirrors `_DeviceThreadIndex`. */
@@ -1136,6 +1293,14 @@ internal class DeviceTextWriter(private val context: Context) {
      * one-to-one against the other path's pair instead of collapsing to one.
      * The survivor takes the newcomer's key in `deviceDedupKeyAlt`, and the
      * next sweep matches on that key exactly, with no guessing.
+     *
+     * 🛑 A CONTACT CARD's two copies do not share words (2026-10-15). The
+     * notification may file the sender's stand-in "Contact card" with no
+     * data URI, and the provider files the same MMS with the vCard and NO
+     * text (the placeholder is dropped beside a parsed card). So a
+     * placeholder-only text and an empty/placeholder one also pair — but
+     * only when EXACTLY ONE side carries the card. Two card-less blanks are
+     * two pictures; two cards are two cards.
      */
     private class ThreadDedupe private constructor(private val rows: MutableList<Row>) {
 
@@ -1146,25 +1311,34 @@ internal class DeviceTextWriter(private val context: Context) {
             val outgoing: Boolean,
             val text: String,
             val millis: Long,
+            /** Holds a contact card (or the raw `.vcf` of one). */
+            var hasCard: Boolean = false,
             var claimed: Boolean = false,
         )
 
         /**
          * The id of the message already holding this text, or null when it is
-         * new to the thread.
+         * new to the thread. [hasCard]: the newcomer carries a vCard part.
          */
-        fun duplicateOf(dedupKey: String, outgoing: Boolean, text: String, millis: Long): String? {
+        fun duplicateOf(
+            dedupKey: String,
+            outgoing: Boolean,
+            text: String,
+            millis: Long,
+            hasCard: Boolean = false,
+        ): String? {
             val ns = namespaceOf(dedupKey)
             val body = normalize(text)
             // Written by an earlier sweep that already folded this key in.
             rows.firstOrNull { it.alts.contains(dedupKey) }?.let { return it.id }
-            if (body.isEmpty()) return null
+            if (body.isEmpty() && !hasCard) return null
             return rows.firstOrNull { row ->
                 !row.claimed &&
                     row.namespace != ns &&
                     row.outgoing == outgoing &&
-                    row.text == body &&
-                    kotlin.math.abs(row.millis - millis) <= WINDOW_MS
+                    kotlin.math.abs(row.millis - millis) <= WINDOW_MS &&
+                    ((body.isNotEmpty() && row.text == body) ||
+                        cardTwins(row.text, row.hasCard, body, hasCard))
             }?.also {
                 it.claimed = true
                 it.alts.add(dedupKey)
@@ -1172,7 +1346,14 @@ internal class DeviceTextWriter(private val context: Context) {
         }
 
         /** Adds a message this batch is about to write. */
-        fun record(docId: String, dedupKey: String, outgoing: Boolean, text: String, millis: Long) {
+        fun record(
+            docId: String,
+            dedupKey: String,
+            outgoing: Boolean,
+            text: String,
+            millis: Long,
+            hasCard: Boolean = false,
+        ) {
             rows.add(
                 Row(
                     id = docId,
@@ -1181,8 +1362,21 @@ internal class DeviceTextWriter(private val context: Context) {
                     outgoing = outgoing,
                     text = normalize(text),
                     millis = millis,
+                    hasCard = hasCard,
                 )
             )
+        }
+
+        /** Whether the message [docId] already holds a contact card. */
+        fun carriesCard(docId: String): Boolean = rows.any { it.id == docId && it.hasCard }
+
+        /** Whether the message [docId]'s words are only a card placeholder. */
+        fun placeholderOnly(docId: String): Boolean =
+            rows.firstOrNull { it.id == docId }?.let { VCardParser.isPlaceholderText(it.text) } == true
+
+        /** The card was just written onto [docId]; a third copy adds nothing. */
+        fun markCard(docId: String) {
+            rows.filter { it.id == docId }.forEach { it.hasCard = true }
         }
 
         companion object {
@@ -1226,6 +1420,13 @@ internal class DeviceTextWriter(private val context: Context) {
                         (alt as? String)?.takeIf { it.isNotEmpty() }?.let { alts.add(it) }
                     }
                     val at = (doc.get(FIELD_CREATED) as? Timestamp)?.toDate()?.time ?: continue
+                    val hasCard = (doc.get("attachments") as? Iterable<*>)?.any { a ->
+                        val m = a as? Map<*, *>
+                        m != null && (
+                            m["type"] == "contact" ||
+                                VCardParser.isVCardMime(m["mimeType"] as? String, m["fileName"] as? String)
+                            )
+                    } == true
                     rows.add(
                         Row(
                             id = doc.id,
@@ -1234,6 +1435,7 @@ internal class DeviceTextWriter(private val context: Context) {
                             outgoing = doc.get("senderRef") != null,
                             text = normalize((doc.get("text") as? String).orEmpty()),
                             millis = at,
+                            hasCard = hasCard,
                         )
                     )
                 }
@@ -1244,6 +1446,29 @@ internal class DeviceTextWriter(private val context: Context) {
             private fun namespaceOf(key: String): String = key.substringBefore('|')
 
             private fun normalize(text: String): String = text.trim().lowercase()
+
+            /**
+             * Two copies of one shared contact: exactly one side holds the
+             * card, its words are empty or a placeholder, and the card-less
+             * side's words ARE a placeholder (an empty card-less row is a
+             * picture, not this).
+             */
+            private fun cardTwins(aText: String, aCard: Boolean, bText: String, bCard: Boolean): Boolean {
+                if (!aCard && !bCard) return false
+                // Both copies carry the card (a vCard data URI on the
+                // notification AND the MMS part): the same message when
+                // neither has words of its own. Claiming is one-to-one and
+                // across capture paths only, so two cards sent back to back
+                // still land as two (2026-10-15).
+                if (aCard && bCard) {
+                    return (aText.isEmpty() || VCardParser.isPlaceholderText(aText)) &&
+                        (bText.isEmpty() || VCardParser.isPlaceholderText(bText))
+                }
+                val cardText = if (aCard) aText else bText
+                val plainText = if (aCard) bText else aText
+                return (cardText.isEmpty() || VCardParser.isPlaceholderText(cardText)) &&
+                    VCardParser.isPlaceholderText(plainText)
+            }
         }
     }
 
@@ -1614,33 +1839,6 @@ private fun <T> await(task: Task<T>): T {
 private fun JSONObject.optStringOrNull(key: String): String? {
     if (!has(key) || isNull(key)) return null
     return optString(key)
-}
-
-/**
- * Whether a capture names someone on the include/exclude list. A NAME
- * matches exactly (case aside); an entry with seven or more digits matches
- * on the last ten digits. 🛑 Mirrors `matchesIncomingList` in
- * message_ingest_service.dart — keep them equal.
- */
-internal fun matchesIncomingList(people: List<String>, names: List<String?>): Boolean {
-    fun digits(s: String) = s.filter { it.isDigit() }
-    fun last10(d: String) = if (d.length > 10) d.substring(d.length - 10) else d
-    for (raw in people) {
-        val entry = raw.trim()
-        if (entry.isEmpty()) continue
-        val entryDigits = digits(entry)
-        for (name in names) {
-            val value = name?.trim().orEmpty()
-            if (value.isEmpty()) continue
-            if (entryDigits.length >= 7) {
-                val valueDigits = digits(value)
-                if (valueDigits.length >= 7 && last10(valueDigits) == last10(entryDigits)) return true
-            } else if (value.equals(entry, ignoreCase = true)) {
-                return true
-            }
-        }
-    }
-    return false
 }
 
 /**

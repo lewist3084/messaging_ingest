@@ -187,15 +187,17 @@ class MessagingIngest {
         .toList(growable: false);
   }
 
-  /// The bytes behind a captured picture's `content://` URI, or null when it
-  /// cannot be read.
+  /// The bytes behind a captured picture's or contact card's `content://`
+  /// URI, or null when it cannot be read.
   ///
   /// Both sources are perishable and process-local: an MMS part is readable
   /// only under this app's READ_SMS grant, and a notification's data URI only
   /// while the notification is posted. So this is a copy-it-now handle, not a
   /// reference to keep — call it on the way to a Storage upload.
   ///
-  /// Returns null past a size cap (12 MB) rather than a truncated image, and
+  /// Returns null past a size cap (12 MB) rather than a truncated image (a
+  /// caller reading a vCard applies its own, smaller cap — 2 MB, as the
+  /// native writer does), and
   /// null for a part the provider has already reclaimed. The caller writes the
   /// message without the picture rather than losing the message.
   ///

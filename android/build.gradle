@@ -41,6 +41,7 @@ android {
 
     sourceSets {
         main.java.srcDirs += 'src/main/kotlin'
+        test.java.srcDirs += 'src/test/kotlin'
     }
 
     defaultConfig {
@@ -75,4 +76,9 @@ dependencies {
     // Release builds install Play Integrity before the first request — the
     // Dart side does the same from BootService, but only when an engine runs.
     implementation 'com.google.firebase:firebase-appcheck-playintegrity'
+
+    // VCardParserTest (2026-10-15) — the parser is pure JVM so it is checked
+    // against comms_kit's vCard fixtures off-device. Test-scoped: nothing
+    // here reaches an app's APK.
+    testImplementation 'junit:junit:4.13.2'
 }

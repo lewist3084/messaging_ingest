@@ -10,7 +10,7 @@
 /// contact's display name in the same position of [names]. The captured
 /// inbound thread is titled with exactly those display names, which is what
 /// the consumer matches on to file this in the right conversation.
-/// One picture carried by a sent MMS.
+/// One picture — or contact card — carried by a sent MMS.
 ///
 /// [uri] is a `content://mms/part/<id>` handle readable only inside the app's
 /// own process under READ_SMS — the bytes are fetched with
@@ -25,8 +25,12 @@ class SentAttachment {
 
   final String uri;
 
-  /// Always `image/*`: the reader keeps pictures and skips the SMIL layout
-  /// part, vCards and audio, none of which a bubble can render.
+  /// `image/*`, or a vCard type (`text/x-vcard`, `text/vcard`, …) since
+  /// 2026-10-15: the reader keeps pictures and contact cards and skips the
+  /// SMIL layout part and audio, which no bubble renders. A card is parsed
+  /// where it is written (comms_kit `parseVCards` / `VCardParser.kt`) into a
+  /// `type: 'contact'` attachment — test with comms_kit's `isVCardMime`
+  /// (mime AND [fileName]: a gateway may stamp a `.vcf` generically).
   final String mimeType;
   final String fileName;
 

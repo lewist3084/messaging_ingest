@@ -340,12 +340,19 @@ class MessageNotificationListener : NotificationListenerService() {
             val text = message.text?.toString().orEmpty()
             // A picture message posts a notification with an EMPTY text and a
             // data URI beside it — which the `?: continue` here used to drop
-            // whole, so an incoming photo simply never arrived. Images only:
-            // anything else the shade can carry has no bubble to render it in.
+            // whole, so an incoming photo simply never arrived. Images and
+            // contact cards only: anything else the shade can carry has no
+            // bubble to render it in. A vCard (RCS from Google Messages may
+            // carry one as the data URI) is kept since 2026-10-15 — the
+            // writer parses it into a `contact` attachment.
             val dataUri = message.dataUri
             val dataMime = message.dataMimeType?.trim().orEmpty().lowercase()
-            val imageUri = if (dataMime.startsWith("image/")) dataUri else null
-            if (text.isEmpty() && imageUri == null) continue
+            val dataAttachmentUri = if (dataMime.startsWith("image/") || VCardParser.isVCardMime(dataMime)) {
+                dataUri
+            } else {
+                null
+            }
+            if (text.isEmpty() && dataAttachmentUri == null) continue
             // 🛑 Android 15 redacts a one-time-code text for a listener it does
             // not trust: the Person is stripped and the text replaced with this
             // placeholder. Stripped Person + "from me" convention below meant
@@ -372,7 +379,8 @@ class MessageNotificationListener : NotificationListenerService() {
                 add(message.timestamp.toString())
                 add(senderName ?: "self")
                 add(text.hashCode().toString())
-                // 🛑 APPENDED ONLY WHEN THERE IS AN IMAGE. This key is the
+                // 🛑 APPENDED ONLY WHEN THERE IS AN ATTACHMENT (a picture
+                // or, since 2026-10-15, a contact card). This key is the
                 // Firestore document id (`DartDocId.docIdFor`) and the local
                 // seen-ledger's key, so adding a segment unconditionally would
                 // re-key every text already captured — every one of them would
@@ -380,7 +388,7 @@ class MessageNotificationListener : NotificationListenerService() {
                 // member's threads would double. Two pictures sent in the same
                 // second under one caption do need separating, so the segment
                 // exists; it just cannot exist for a plain text.
-                if (imageUri != null) add(imageUri.toString().hashCode().toString())
+                if (dataAttachmentUri != null) add(dataAttachmentUri.toString().hashCode().toString())
             }.joinToString("|")
 
             if (store.hasSeen(dedupKey)) continue
@@ -395,12 +403,12 @@ class MessageNotificationListener : NotificationListenerService() {
                 put("senderName", senderName ?: JSONObject.NULL)
                 put("isFromMe", isFromMe)
                 put("text", text)
-                // The picture, when there is one. A content URI the shade
+                // The picture or contact card, when there is one. A content URI the shade
                 // granted US read on — it is not readable by any other
                 // process and it does not survive the notification, so the
                 // writer uploads it on the way past rather than storing it.
-                put("attachmentUri", imageUri?.toString() ?: JSONObject.NULL)
-                put("attachmentMime", if (imageUri != null) dataMime else JSONObject.NULL)
+                put("attachmentUri", dataAttachmentUri?.toString() ?: JSONObject.NULL)
+                put("attachmentMime", if (dataAttachmentUri != null) dataMime else JSONObject.NULL)
                 put("timestamp", message.timestamp)
                 put("postedAt", sbn.postTime)
                 // Whether a RemoteInput reply action was still attached when we
