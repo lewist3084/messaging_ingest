@@ -3,8 +3,9 @@
 /// This is a *capture*, not a wire format — it records what the notification
 /// actually carried, including the gaps. [senderName] is a contact display
 /// name, never a phone number: Android's `Person.uri` is optional and Google
-/// Messages does not populate it, so resolving a sender to a number means
-/// matching against Contacts on the Dart side.
+/// Messages mostly does not populate it. When it does, [senderNumber] and
+/// [partyNumbers] carry what it said (2026-10-23); when it does not, the
+/// thread index joins a name-only capture to its provider copy by content.
 class IngestedMessage {
   const IngestedMessage({
     required this.dedupKey,
@@ -20,6 +21,8 @@ class IngestedMessage {
     required this.canReply,
     this.attachmentUri,
     this.attachmentMimeType,
+    this.senderNumber,
+    this.partyNumbers = const <String>[],
   });
 
   /// Stable identity for this message. Notifications re-post their whole recent
@@ -42,6 +45,14 @@ class IngestedMessage {
 
   /// Contact display name of the sender. Null when the message is ours.
   final String? senderName;
+
+  /// The sender's number from the Person's `tel:` URI, `+` and digits, when
+  /// the handset set one. Null when it did not, and when the message is ours.
+  final String? senderNumber;
+
+  /// Every `tel:` the notification named for the thread — the sender's and
+  /// the people list's — in the handset's order. Empty on most RCS threads.
+  final List<String> partyNumbers;
 
   final bool isFromMe;
 
@@ -94,12 +105,22 @@ class IngestedMessage {
       conversationTitle: map['conversationTitle'] as String?,
       isGroup: (map['isGroup'] as bool?) ?? false,
       senderName: map['senderName'] as String?,
+      senderNumber: _number(map['senderNumber']),
+      partyNumbers: <String>[
+        for (final n in (map['partyNumbers'] as List?) ?? const <Object?>[])
+          if (_number(n) case final String number) number,
+      ],
       isFromMe: (map['isFromMe'] as bool?) ?? false,
       text: text ?? '',
       timestamp: _millis(map['timestamp']),
       postedAt: _millis(map['postedAt']),
       canReply: (map['canReply'] as bool?) ?? false,
     );
+  }
+
+  static String? _number(Object? raw) {
+    final s = raw is String ? raw.trim() : '';
+    return s.isEmpty ? null : s;
   }
 
   static DateTime _millis(Object? raw) {
@@ -114,6 +135,8 @@ class IngestedMessage {
         'conversationTitle': conversationTitle,
         'isGroup': isGroup,
         'senderName': senderName,
+        'senderNumber': senderNumber,
+        'partyNumbers': partyNumbers,
         'isFromMe': isFromMe,
         'text': text,
         'attachmentUri': attachmentUri,

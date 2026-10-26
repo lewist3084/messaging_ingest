@@ -105,8 +105,22 @@ internal fun JSONObject.toMap(): Map<String, Any?> {
     val it = keys()
     while (it.hasNext()) {
         val k = it.next()
-        val v = get(k)
-        out[k] = if (v === JSONObject.NULL) null else v
+        out[k] = jsonValue(get(k))
     }
     return out
+}
+
+/**
+ * A JSON value as the platform channel can carry it. The codec knows lists
+ * and maps, not `JSONArray` / `JSONObject`, so a payload that carries one
+ * (the numbers a notification named, 2026-10-23) is converted on the way out
+ * instead of failing to encode.
+ */
+private fun jsonValue(v: Any?): Any? = when {
+    v == null || v === JSONObject.NULL -> null
+    v is JSONObject -> v.toMap()
+    v is org.json.JSONArray -> ArrayList<Any?>(v.length()).also { list ->
+        for (i in 0 until v.length()) list.add(jsonValue(v.opt(i)))
+    }
+    else -> v
 }

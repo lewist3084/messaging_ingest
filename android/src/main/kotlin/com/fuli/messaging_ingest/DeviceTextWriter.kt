@@ -78,6 +78,9 @@ import java.util.concurrent.TimeoutException
 internal class DeviceTextWriter(private val context: Context) {
 
     companion object {
+        /** [learnContactNumbers] has run in this process. */
+        @Volatile private var contactsSwept = false
+
         private const val TAG = "DeviceTextWriter"
 
         /** One thread: writes are serialised, and Firestore's own worker does
@@ -266,12 +269,13 @@ internal class DeviceTextWriter(private val context: Context) {
         // Preview line per message, keyed on dedup key, so a picture with no
         // caption advances the thread as "📷 Photo" rather than as blank.
         val previews = HashMap<String, String>()
+        val learning = ThreadLearning()
         // 🛑 Loaded lazily, and the message is NOT filed without it. Until
         // 2026-09-17 this path minted `device_<conversationKey>` without
         // looking, so a reply to a text the member had SENT (filed by
         // syncSent as `device_sms_<threadId>`) opened a second thread for
         // the same people, and every message after it landed in both.
-        var index: ThreadIndex? = null
+        var index: DeviceThreadIndex? = null
         var count = 0
         for (m in payloads) {
             val packageName = m.optString("packageName")
@@ -287,10 +291,11 @@ internal class DeviceTextWriter(private val context: Context) {
             val conversationKey = m.optString("conversationKey")
             val dedupKey = m.optString("dedupKey")
             if (conversationKey.isEmpty() || dedupKey.isEmpty()) continue
-            val idx = index ?: ThreadIndex.load(s)?.also { index = it }
+            val idx = index ?: loadThreadIndex(s)?.also { index = it }
                 ?: return Outcome.DEFER
-            val threadId = idx.resolveInbound(conversationKey, threadTitle(m))
-            val threadRef = s.company.collection(COL_CONVERSATION).document(threadId)
+            val isGroup = m.optBoolean("isGroup", false)
+            val numbers = notificationNumbers(m)
+            var threadId = idx.resolveInbound(conversationKey, threadTitle(m), isGroup, numbers)
             val fromMe = m.optBoolean("isFromMe", false)
             val senderName = m.optStringOrNull("senderName")
             val timestamp = m.optLong("timestamp", 0L)
@@ -298,14 +303,6 @@ internal class DeviceTextWriter(private val context: Context) {
 
             val messageDocId = DartDocId.docIdFor(dedupKey)
             val text = m.optString("text")
-            // 🛑 THE SAME TEXT, CAPTURED TWICE. This path keys on the
-            // notification (`<package>|<conv>|<ts>|<sender>|<hash>`) and the
-            // provider path keys on the SMS/MMS row id (`mms|37026`), so
-            // neither could ever see the other's copy — and both capture an
-            // outgoing text. Ask the thread what it already holds.
-            val dedupe = dedupers.getOrPut(threadId) {
-                ThreadDedupe.recent(threadRef)
-            }
             // A picture (or a contact card) arrives as a notification data
             // URI beside an empty text. The grant on it dies with the
             // notification, so it is copied to Storage below — there is no
@@ -322,7 +319,43 @@ internal class DeviceTextWriter(private val context: Context) {
                         SentMessageReader.extensionFor(attachmentMime),
                 )
             )
-            val twin = dedupe.duplicateOf(dedupKey, fromMe, text, timestamp, partsCarryCard(parts))
+            val hasCard = partsCarryCard(parts)
+            // 🛑 THE SAME PERSON, FILED TWICE (2026-10-23). A sender who is not
+            // in the phone's contacts reaches this path as a NAME alone
+            // (`~Carrie Folsom`) and the provider path as a NUMBER alone, so
+            // no key could join them and each minted its own thread. When no
+            // key matched and this would be a new 1:1 thread, ask whether
+            // another thread active in the window already holds this very
+            // text from the other path — see DeviceThreadIndex.threadHoldingTwin.
+            if (idx.isNew(threadId) && !isGroup) {
+                idx.threadHoldingTwin(threadId, timestamp, numbers) { candidate ->
+                    dedupers.getOrPut(candidate) { ThreadDedupe.recent(conversationRef(s, candidate)) }
+                        .hasTwin(dedupKey, fromMe, text, timestamp, hasCard)
+                }?.let { into ->
+                    idx.adopt(threadId, into)
+                    threadId = into
+                }
+            }
+            val threadRef = conversationRef(s, threadId)
+            // What this capture knew about the other party, for the thread
+            // to keep: the numbers the handset named, the name it wore.
+            learning.note(
+                threadId,
+                idx.learn(
+                    threadId,
+                    numbers + listOfNotNull(threadTitle(m), senderName.takeIf { !fromMe }),
+                    isGroup,
+                ),
+            )
+            // 🛑 THE SAME TEXT, CAPTURED TWICE. This path keys on the
+            // notification (`<package>|<conv>|<ts>|<sender>|<hash>`) and the
+            // provider path keys on the SMS/MMS row id (`mms|37026`), so
+            // neither could ever see the other's copy — and both capture an
+            // outgoing text. Ask the thread what it already holds.
+            val dedupe = dedupers.getOrPut(threadId) {
+                ThreadDedupe.recent(threadRef)
+            }
+            val twin = dedupe.duplicateOf(dedupKey, fromMe, text, timestamp, hasCard)
             if (twin != null) {
                 val fold = HashMap<String, Any?>()
                 // So the next sweep matches on the KEY and never has to
@@ -407,13 +440,17 @@ internal class DeviceTextWriter(private val context: Context) {
                 text = previews[m.optString("dedupKey")] ?: m.optString("text"),
                 senderName = if (fromMe) s.memberName else (senderName ?: "Unknown"),
                 atMillis = m.optLong("timestamp", 0L),
-                extra = mapOf(
-                    "devicePackageName" to m.optString("packageName"),
-                    "deviceConversationKey" to m.optString("conversationKey"),
+                extra = withLearned(
+                    mapOf(
+                        "devicePackageName" to m.optString("packageName"),
+                        "deviceConversationKey" to m.optString("conversationKey"),
+                    ),
+                    learning.take(threadId),
                 ),
             )
             if (!ok) allAdvanced = false
         }
+        learning.flush(s)
         // A conversation that has just come alive brings its past with it —
         // once. A group notification names no number to find it by.
         for ((threadId, m) in newestPerThread) {
@@ -424,7 +461,9 @@ internal class DeviceTextWriter(private val context: Context) {
                     threadId,
                     handsetThreadId = null,
                     beforeMillis = m.optLong("timestamp", 0L) - HISTORY_MARGIN_MS,
-                    whoForLookup = threadTitle(m),
+                    // The number when the handset named one — an unsaved
+                    // sender's past was unreachable by name alone.
+                    whoForLookup = notificationNumbers(m).firstOrNull() ?: threadTitle(m),
                 )
             }.onFailure { Log.w(TAG, "history pull failed for $threadId: ${it.message}") }
         }
@@ -462,6 +501,9 @@ internal class DeviceTextWriter(private val context: Context) {
         val out = ArrayList<String?>()
         out.add(m.optStringOrNull("senderName"))
         m.optStringOrNull("conversationTitle")?.split(',')?.let { out.addAll(it) }
+        // The numbers the handset named (2026-10-23): a directory that holds
+        // the number and not the RCS name still admits the text.
+        out.addAll(notificationNumbers(m))
         return out
     }
 
@@ -490,7 +532,7 @@ internal class DeviceTextWriter(private val context: Context) {
         val s = session() ?: return 0
         if (s.captureOff) return 0
 
-        var index: ThreadIndex? = null
+        var index: DeviceThreadIndex? = null
         var written = 0
         for (page in 0 until SENT_PAGES_PER_SYNC) {
             val watermark = reader.watermark()
@@ -505,7 +547,7 @@ internal class DeviceTextWriter(private val context: Context) {
             if (rows.isEmpty()) break
 
             // Watermark untouched on failure: the next sync re-reads.
-            val idx = index ?: ThreadIndex.load(s)?.also { index = it } ?: break
+            val idx = index ?: loadThreadIndex(s)?.also { index = it } ?: break
             val batch = s.db.batch()
             val newestPerThread = HashMap<String, SentRow>()
             val oldestPerThread = HashMap<String, SentRow>()
@@ -514,6 +556,7 @@ internal class DeviceTextWriter(private val context: Context) {
             // Preview line per message, so the thread advance below can show
             // "📷 Photo" for a picture that carried no caption.
             val previews = HashMap<String, String>()
+            val learning = ThreadLearning()
             var newest = 0L
             var count = 0
             // The directory could not be asked about a row: this page is
@@ -528,17 +571,33 @@ internal class DeviceTextWriter(private val context: Context) {
                     false -> continue
                     true -> {}
                 }
-                val threadId = idx.resolve(row)
-                val threadRef = s.company.collection(COL_CONVERSATION).document(threadId)
+                var threadId = idx.resolveSent(row.threadId, row.addresses, row.names)
+                val hasCard = partsCarryCard(row.attachments)
+                // A number with no thread of its own yet: the member's text
+                // may already sit in the thread the notification NAMED for
+                // the same person (an unsaved sender) — see the inbound path.
+                if (idx.isNew(threadId) && row.addresses.size == 1) {
+                    idx.threadHoldingTwin(threadId, row.timestamp, row.addresses) { candidate ->
+                        dedupers.getOrPut(candidate) { ThreadDedupe.recent(conversationRef(s, candidate)) }
+                            .hasTwin(row.dedupKey, true, row.text, row.timestamp, hasCard)
+                    }?.let { into ->
+                        idx.adopt(threadId, into)
+                        threadId = into
+                    }
+                }
+                val threadRef = conversationRef(s, threadId)
+                learning.note(
+                    threadId,
+                    idx.learn(threadId, row.addresses + row.names, row.addresses.size > 1),
+                    handsetThreadId = row.threadId,
+                )
                 val messageDocId = DartDocId.docIdFor(row.dedupKey)
                 // The notification listener has usually already filed this
                 // very text — see the note on the inbound path.
                 val dedupe = dedupers.getOrPut(threadId) {
                     ThreadDedupe.recent(threadRef)
                 }
-                val twin = dedupe.duplicateOf(
-                    row.dedupKey, true, row.text, row.timestamp, partsCarryCard(row.attachments),
-                )
+                val twin = dedupe.duplicateOf(row.dedupKey, true, row.text, row.timestamp, hasCard)
                 if (twin != null) {
                     val fold = HashMap<String, Any?>()
                     fold["deviceDedupKeyAlt"] = FieldValue.arrayUnion(row.dedupKey)
@@ -626,12 +685,16 @@ internal class DeviceTextWriter(private val context: Context) {
                     text = previews[row.dedupKey] ?: row.text,
                     senderName = s.memberName,
                     atMillis = row.timestamp,
-                    extra = mapOf(
-                        "deviceSmsThreadId" to row.threadId,
-                        "deviceRecipients" to row.addresses,
+                    extra = withLearned(
+                        mapOf(
+                            "deviceSmsThreadId" to row.threadId,
+                            "deviceRecipients" to row.addresses,
+                        ),
+                        learning.take(threadId),
                     ),
                 )
             }
+            learning.flush(s)
 
             // Only now: the batch is durable.
             if (newest > 0L) reader.ack(newest)
@@ -664,7 +727,59 @@ internal class DeviceTextWriter(private val context: Context) {
         val inbox = runCatching { syncInbox() }
             .onFailure { Log.w(TAG, "inbox sync failed: ${it.message}") }
             .getOrDefault(0)
+        runCatching { learnContactNumbers() }
+            .onFailure { Log.w(TAG, "contact-number sweep failed: ${it.message}") }
         return sent + inbox
+    }
+
+    /**
+     * Teaches every one-to-one thread titled with a CONTACT's name the
+     * number the phone's contacts hold under it (2026-10-26), once per
+     * thread. The listener now learns it on each new text; this is for the
+     * threads that were filed before it did — an RCS chat with a saved
+     * contact never reaches the provider store, so nothing else would ever
+     * teach them. A thread with a number already, a group, a thread headed
+     * by digits, and a thread already looked at (`deviceNumberLookupAt`) are
+     * left alone; a name the contacts hold twice, or not at all, is stamped
+     * looked-at with no number — never guessed. Once per process, so a
+     * phone that syncs every few minutes reads its threads for this once.
+     */
+    private fun learnContactNumbers() {
+        if (contactsSwept) return
+        val reader = SentMessageReader(context)
+        if (!reader.contactsGranted()) return
+        val s = session() ?: return
+        if (s.captureOff) return
+        // list-cap: 500. One member's own phone; same cap as the thread index.
+        val snap = await(
+            s.company.collection(COL_CONVERSATION)
+                .whereEqualTo("channel", "device")
+                .whereArrayContains("participantRefs", s.memberRef)
+                .limit(500)
+                .get(),
+        )
+        contactsSwept = true
+        val sender = SmsSender(context)
+        var batch = s.db.batch()
+        var pending = 0
+        for (doc in snap.documents) {
+            if (doc.get("isGroup") == true) continue
+            if (doc.get("deviceNumberLookupAt") != null) continue
+            if (stringsOf(doc.get("deviceRecipients")).isNotEmpty()) continue
+            val title = (doc.get("title") as? String)?.trim().orEmpty()
+            if (title.isEmpty() || title.startsWith("~") || SmsSender.looksLikeNumber(title)) continue
+            val number = runCatching { sender.resolveNumber(title) }.getOrNull()
+            val fields = HashMap<String, Any?>()
+            fields["deviceNumberLookupAt"] = FieldValue.serverTimestamp()
+            if (number != null) fields["deviceRecipients"] = FieldValue.arrayUnion(number)
+            batch.set(doc.reference, fields, SetOptions.merge())
+            if (++pending >= 400) {
+                await(batch.commit())
+                batch = s.db.batch()
+                pending = 0
+            }
+        }
+        if (pending > 0) await(batch.commit())
     }
 
     /**
@@ -696,7 +811,7 @@ internal class DeviceTextWriter(private val context: Context) {
         val s = session() ?: return 0
         if (s.captureOff) return 0
 
-        var index: ThreadIndex? = null
+        var index: DeviceThreadIndex? = null
         var written = 0
         for (page in 0 until SENT_PAGES_PER_SYNC) {
             val watermark = reader.inboxWatermark()
@@ -710,11 +825,12 @@ internal class DeviceTextWriter(private val context: Context) {
                 .getOrElse { emptyList() }
             if (rows.isEmpty()) break
 
-            val idx = index ?: ThreadIndex.load(s)?.also { index = it } ?: break
+            val idx = index ?: loadThreadIndex(s)?.also { index = it } ?: break
             val batch = s.db.batch()
             val newestPerThread = HashMap<String, InboxRow>()
             val dedupers = HashMap<String, ThreadDedupe>()
             val previews = HashMap<String, String>()
+            val learning = ThreadLearning()
             var merged = 0
             var newest = 0L
             var count = 0
@@ -732,15 +848,32 @@ internal class DeviceTextWriter(private val context: Context) {
                     false -> continue
                     true -> {}
                 }
-                val threadId = idx.resolveInbox(row) ?: continue
-                val threadRef = s.company.collection(COL_CONVERSATION).document(threadId)
+                var threadId = idx.resolveInbox(row.threadId, row.sender, row.displayName, row.others)
+                    ?: continue
+                val hasCard = partsCarryCard(row.attachments)
+                // An unsaved sender: the listener may have filed this very text
+                // a second ago under the sender's RCS NAME, with no number to
+                // meet this row on — see the inbound path.
+                if (idx.isNew(threadId)) {
+                    idx.threadHoldingTwin(threadId, row.timestamp, listOf(row.sender)) { candidate ->
+                        dedupers.getOrPut(candidate) { ThreadDedupe.recent(conversationRef(s, candidate)) }
+                            .hasTwin(row.dedupKey, false, row.text, row.timestamp, hasCard)
+                    }?.let { into ->
+                        idx.adopt(threadId, into)
+                        threadId = into
+                    }
+                }
+                val threadRef = conversationRef(s, threadId)
+                learning.note(
+                    threadId,
+                    idx.learn(threadId, listOf(row.sender, row.senderName), false),
+                    handsetThreadId = row.threadId,
+                )
                 val messageDocId = DartDocId.docIdFor(row.dedupKey)
                 // The listener usually filed this very text a second ago —
                 // the same twin rule as the sent side, the other direction.
                 val dedupe = dedupers.getOrPut(threadId) { ThreadDedupe.recent(threadRef) }
-                val twin = dedupe.duplicateOf(
-                    row.dedupKey, false, row.text, row.timestamp, partsCarryCard(row.attachments),
-                )
+                val twin = dedupe.duplicateOf(row.dedupKey, false, row.text, row.timestamp, hasCard)
                 if (twin != null) {
                     val fold = HashMap<String, Any?>()
                     fold["deviceDedupKeyAlt"] = FieldValue.arrayUnion(row.dedupKey)
@@ -818,9 +951,13 @@ internal class DeviceTextWriter(private val context: Context) {
                     text = previews[row.dedupKey] ?: row.text,
                     senderName = row.displayName,
                     atMillis = row.timestamp,
-                    extra = mapOf("deviceSmsThreadId" to row.threadId),
+                    extra = withLearned(
+                        mapOf("deviceSmsThreadId" to row.threadId),
+                        learning.take(threadId),
+                    ),
                 )
             }
+            learning.flush(s)
 
             // Only now: the batch is durable.
             if (newest > 0L) reader.ackInbox(newest)
@@ -1327,22 +1464,52 @@ internal class DeviceTextWriter(private val context: Context) {
             millis: Long,
             hasCard: Boolean = false,
         ): String? {
-            val ns = namespaceOf(dedupKey)
-            val body = normalize(text)
             // Written by an earlier sweep that already folded this key in.
             rows.firstOrNull { it.alts.contains(dedupKey) }?.let { return it.id }
+            return twinOf(dedupKey, outgoing, text, millis, hasCard)?.also {
+                it.claimed = true
+                it.alts.add(dedupKey)
+            }?.id
+        }
+
+        /**
+         * Whether the thread holds a twin of this text — [duplicateOf]
+         * without claiming it. The cross-thread join asks this of OTHER
+         * threads before a path mints a new one (2026-10-23); the path that
+         * then files into the thread it names claims the twin itself.
+         */
+        fun hasTwin(
+            dedupKey: String,
+            outgoing: Boolean,
+            text: String,
+            millis: Long,
+            hasCard: Boolean = false,
+        ): Boolean =
+            rows.any { it.alts.contains(dedupKey) } ||
+                twinOf(dedupKey, outgoing, text, millis, hasCard) != null
+
+        private fun twinOf(
+            dedupKey: String,
+            outgoing: Boolean,
+            text: String,
+            millis: Long,
+            hasCard: Boolean,
+        ): Row? {
+            val ns = namespaceOf(dedupKey)
+            val body = normalize(text)
             if (body.isEmpty() && !hasCard) return null
             return rows.firstOrNull { row ->
                 !row.claimed &&
                     row.namespace != ns &&
+                    // A row that already folded a key from THIS path has met
+                    // its twin; a second same-words row from this path is a
+                    // second message, not a third copy.
+                    row.alts.none { namespaceOf(it) == ns } &&
                     row.outgoing == outgoing &&
                     kotlin.math.abs(row.millis - millis) <= WINDOW_MS &&
                     ((body.isNotEmpty() && row.text == body) ||
                         cardTwins(row.text, row.hasCard, body, hasCard))
-            }?.also {
-                it.claimed = true
-                it.alts.add(dedupKey)
-            }?.id
+            }
         }
 
         /** Adds a message this batch is about to write. */
@@ -1472,119 +1639,116 @@ internal class DeviceTextWriter(private val context: Context) {
         }
     }
 
-    private class ThreadIndex(
-        private val byHandsetThread: HashMap<String, String>,
-        private val byConversationKey: HashMap<String, String>,
-        private val byParties: HashMap<String, String>,
-    ) {
-        private val created = HashSet<String>()
+    /**
+     * The member's device threads as [DeviceThreadIndex] rows — the index
+     * itself is pure and lives in DeviceThreadIndex.kt. Null when the read
+     * failed: a caller that cannot see the existing threads must not file,
+     * or it re-creates the split the index exists to prevent.
+     */
+    private fun loadThreadIndex(s: Session): DeviceThreadIndex? {
+        val snap = runCatching {
+            // list-cap: 500. One member's own phone; the live member has 38
+            // device threads (measured 2026-09-06). Same cap as the Dart index.
+            await(
+                s.company.collection(COL_CONVERSATION)
+                    .whereEqualTo("channel", "device")
+                    .whereArrayContains("participantRefs", s.memberRef)
+                    .limit(500)
+                    .get(),
+            )
+        }.onFailure { Log.w(TAG, "thread index load failed: ${it.message}") }
+            .getOrNull() ?: return null
+        val rows = snap.documents.map { doc ->
+            DeviceThreadIndex.ThreadRow(
+                id = doc.id,
+                handsetThreadId = doc.get("deviceSmsThreadId") as? String,
+                conversationKey = doc.get("deviceConversationKey") as? String,
+                title = (doc.get("title") as? String).orEmpty(),
+                numbers = stringsOf(doc.get("deviceRecipients")),
+                aliases = stringsOf(doc.get("deviceAliases")),
+                isGroup = doc.get("isGroup") == true,
+                lastMessageMillis = (doc.get("lastMessageAt") as? Timestamp)?.toDate()?.time,
+            )
+        }
+        return DeviceThreadIndex(rows)
+    }
 
-        companion object {
-            /** Null when the read failed: a caller that cannot see the
-             *  existing threads must not file, or it re-creates the split
-             *  this index exists to prevent. */
-            fun load(s: Session): ThreadIndex? {
-                val byHandset = HashMap<String, String>()
-                val byKey = HashMap<String, String>()
-                val byParties = HashMap<String, String>()
-                val snap = runCatching {
-                    // list-cap: 500. One member's own phone; the live member
-                    // has 38 device threads (measured 2026-09-06). Same cap
-                    // as the Dart index.
-                    await(
-                        s.company.collection(COL_CONVERSATION)
-                            .whereEqualTo("channel", "device")
-                            .whereArrayContains("participantRefs", s.memberRef)
-                            .limit(500)
-                            .get(),
-                    )
-                }.onFailure { Log.w(TAG, "thread index load failed: ${it.message}") }
-                    .getOrNull() ?: return null
-                for (doc in snap.documents) {
-                    val handset = (doc.get("deviceSmsThreadId") as? String)?.trim().orEmpty()
-                    if (handset.isNotEmpty()) byHandset[handset] = doc.id
-                    val key = (doc.get("deviceConversationKey") as? String)?.trim().orEmpty()
-                    if (key.isNotEmpty()) byKey[key] = doc.id
-                    val title = (doc.get("title") as? String).orEmpty()
-                    val parties = partiesKey(title.split(','))
-                    // First one wins: two threads with the same people
-                    // keep filing into the same one.
-                    if (parties.isNotEmpty() && !byParties.containsKey(parties)) byParties[parties] = doc.id
-                }
-                return ThreadIndex(byHandset, byKey, byParties)
+    private fun stringsOf(v: Any?): List<String> =
+        (v as? Iterable<*>)?.mapNotNull { (it as? String)?.trim()?.takeIf { t -> t.isNotEmpty() } }
+            ?: emptyList()
+
+    private fun conversationRef(s: Session, threadId: String): DocumentReference =
+        s.company.collection(COL_CONVERSATION).document(threadId)
+
+    /**
+     * The numbers a notification named for the other party (2026-10-23):
+     * the sender's `tel:` URI when Google Messages set one on the Person,
+     * and the notification's people list. Empty for most RCS threads — the
+     * listener records what the handset gave, and the cross-thread twin join
+     * is what covers a name-only capture.
+     */
+    private fun notificationNumbers(m: JSONObject): List<String> {
+        val out = LinkedHashSet<String>()
+        m.optStringOrNull("senderNumber")?.trim()?.takeIf { it.isNotEmpty() }?.let { out.add(it) }
+        val arr = m.optJSONArray("partyNumbers")
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                arr.optString(i)?.trim()?.takeIf { it.isNotEmpty() }?.let { out.add(it) }
             }
         }
+        return out.toList()
+    }
 
-        /**
-         * The conversation a captured NOTIFICATION belongs in: the thread
-         * that already carries this `deviceConversationKey`, else the thread
-         * with the same people in its title (the one `syncSent` made when
-         * the member wrote first — `partiesKey` sorts, so the handset's
-         * recipient order and Google Messages' title order agree), else a
-         * new `device_<conversationKey>`. The thread advance stamps the key
-         * on whichever it lands on, so the next notification is a lookup.
-         */
-        fun resolveInbound(conversationKey: String, title: String?): String {
-            byConversationKey[conversationKey]?.let { return it }
-            val key = partiesKey(title.orEmpty().split(','))
-            val byTitle = if (key.isEmpty()) null else byParties[key]
-            val id = byTitle ?: DartDocId.deviceConversationId(conversationKey)
-            if (byTitle == null) {
-                created.add(id)
-                if (key.isNotEmpty()) byParties[key] = id
-            }
-            byConversationKey[conversationKey] = id
-            return id
+    /** [base] with what the thread learned, where the base does not already
+     *  say it (the sent path writes `deviceRecipients` whole; a union must
+     *  not fight it in one set). */
+    private fun withLearned(base: Map<String, Any?>, learned: Map<String, Any?>): Map<String, Any?> =
+        if (learned.isEmpty()) base else base + learned.filterKeys { it !in base }
+
+    /**
+     * What each thread learned about its other party in one pass — numbers,
+     * names, its handset thread id — written ONCE per thread after the batch:
+     * on the thread advance for a thread that got a new message, and as a
+     * merge of its own for a thread that only FOLDED a twin (the case the
+     * cross-thread join creates, and the one that must learn the alias).
+     */
+    private class ThreadLearning {
+        private class Facts {
+            val numbers = LinkedHashSet<String>()
+            val names = LinkedHashSet<String>()
+            var handsetThreadId: String? = null
         }
 
-        fun resolve(row: SentRow): String {
-            byHandsetThread[row.threadId]?.let { return it }
-            val parties = ArrayList<String>(row.addresses.size)
-            for (i in row.addresses.indices) {
-                val name = row.names.getOrNull(i)?.trim().orEmpty()
-                parties.add(if (name.isNotEmpty()) name else row.addresses[i])
-            }
-            val key = partiesKey(parties)
-            val byTitle = byParties[key]
-            val id = byTitle ?: DartDocId.deviceSmsConversationId(row.threadId)
-            if (byTitle == null) {
-                created.add(id)
-                byParties[key] = id
-            }
-            byHandsetThread[row.threadId] = id
-            return id
+        private val facts = HashMap<String, Facts>()
+
+        fun note(threadId: String, learned: DeviceThreadIndex.Learned, handsetThreadId: String? = null) {
+            if (learned.isEmpty && handsetThreadId == null) return
+            val f = facts.getOrPut(threadId) { Facts() }
+            f.numbers.addAll(learned.numbers)
+            f.names.addAll(learned.names)
+            handsetThreadId?.takeIf { it.isNotBlank() }?.let { f.handsetThreadId = it }
         }
 
-        /**
-         * The conversation an INBOUND provider row belongs in, or null when
-         * it cannot be placed safely: the thread carrying this handset id,
-         * else the thread titled with this one sender (`partiesKey` of the
-         * contact name or the number — so a reply files into the thread the
-         * sent text made), else, for a text that names nobody else, a new
-         * `device_sms_<threadId>` titled for the sender.
-         *
-         * 🛑 An MMS that names other recipients beside us may be a GROUP —
-         * and which of those addresses is the phone's own number is not
-         * knowable here. Nothing is created for it; the notification path,
-         * which carries the group's title, is the one that files it.
-         */
-        fun resolveInbox(row: InboxRow): String? {
-            byHandsetThread[row.threadId]?.let { return it }
-            val key = partiesKey(listOf(row.displayName))
-            val byTitle = if (key.isEmpty()) null else byParties[key]
-            if (byTitle != null) {
-                byHandsetThread[row.threadId] = byTitle
-                return byTitle
-            }
-            if (row.others.isNotEmpty()) return null
-            val id = DartDocId.deviceSmsConversationId(row.threadId)
-            created.add(id)
-            if (key.isNotEmpty()) byParties[key] = id
-            byHandsetThread[row.threadId] = id
-            return id
+        /** The merge fields for [threadId], taken off the ledger. */
+        fun take(threadId: String): Map<String, Any?> {
+            val f = facts.remove(threadId) ?: return emptyMap()
+            val out = HashMap<String, Any?>()
+            if (f.numbers.isNotEmpty()) out["deviceRecipients"] = FieldValue.arrayUnion(*f.numbers.toTypedArray())
+            if (f.names.isNotEmpty()) out["deviceAliases"] = FieldValue.arrayUnion(*f.names.toTypedArray())
+            f.handsetThreadId?.let { out["deviceSmsThreadId"] = it }
+            return out
         }
 
-        fun isNew(threadId: String): Boolean = threadId in created
+        /** Whatever no thread advance carried: the fold-only threads. */
+        fun flush(s: Session) {
+            for (id in facts.keys.toList()) {
+                val fields = take(id)
+                if (fields.isEmpty()) continue
+                runCatching {
+                    await(s.company.collection(COL_CONVERSATION).document(id).set(fields, SetOptions.merge()))
+                }.onFailure { Log.w(TAG, "thread learn failed for $id: ${it.message}") }
+            }
+        }
     }
 
     // ── Thread preview ──────────────────────────────────────────────────────
@@ -1865,27 +2029,5 @@ internal fun nationalNumber(raw: String): String {
     return "(" + local.substring(0, 3) + ") " + local.substring(3, 6) + "-" + local.substring(6)
 }
 
-/**
- * One key for "these people", however they are spelled — the Dart
- * `partiesKey`, character for character: names lower-cased, a number reduced
- * to its last ten digits, Google Messages' `~` on a non-contact RCS name
- * dropped, the result sorted and joined with `|`.
- */
-internal fun partiesKey(parts: Iterable<String>): String {
-    val out = ArrayList<String>()
-    for (raw in parts) {
-        var p = raw.trim()
-        if (p.startsWith("~")) p = p.substring(1).trim()
-        if (p.isEmpty()) continue
-        val digits = p.filter { it.isDigit() }
-        val bare = p.filter { it != ' ' && it != '(' && it != ')' && it != '+' && it != '-' && it != '.' && !it.isWhitespace() }
-        if (digits.length >= 5 && digits.length == bare.length) {
-            out.add(if (digits.length > 10) digits.substring(digits.length - 10) else digits)
-        } else {
-            out.add(p.lowercase())
-        }
-    }
-    out.sort()
-    return out.joinToString("|")
-}
+// `partiesKey` lives beside the index that keys on it: DeviceThreadIndex.kt.
 

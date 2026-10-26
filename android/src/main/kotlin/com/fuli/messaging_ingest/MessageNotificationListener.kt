@@ -294,6 +294,7 @@ class MessageNotificationListener : NotificationListenerService() {
         val isGroup = style.isGroupConversation
         val conversationTitle = style.conversationTitle?.toString()
         val selfName = style.user?.name?.toString()
+        val partyNumbers = partyNumbersOf(notification, style)
         val reply = replyActionFor(notification)
         val canReply = reply != null
         // Keep the reply box whether or not any message below is new: a
@@ -304,7 +305,10 @@ class MessageNotificationListener : NotificationListenerService() {
 
         val fresh = ArrayList<JSONObject>()
         try {
-            collectFresh(sbn, conversationKey, isGroup, conversationTitle, selfName, canReply, messages, fresh)
+            collectFresh(
+                sbn, conversationKey, isGroup, conversationTitle, selfName, canReply,
+                partyNumbers, messages, fresh,
+            )
         } finally {
             // A conversation that has just posted can be answered again. Any
             // reply the member typed while this phone had no box for it is
@@ -333,9 +337,13 @@ class MessageNotificationListener : NotificationListenerService() {
         conversationTitle: String?,
         selfName: String?,
         canReply: Boolean,
+        partyNumbers: List<String>,
         messages: List<NotificationCompat.MessagingStyle.Message>,
         fresh: ArrayList<JSONObject>,
     ) {
+        // The sender's number by their CONTACT, looked up once per name per
+        // notification — see [contactNumberFor].
+        val contactNumbers = HashMap<String, String?>()
         for (message in messages) {
             val text = message.text?.toString().orEmpty()
             // A picture message posts a notification with an EMPTY text and a
@@ -372,6 +380,23 @@ class MessageNotificationListener : NotificationListenerService() {
             // (SentMessageReader).
             val isFromMe = message.person == null ||
                 (selfName != null && senderName == selfName)
+            // The sender's number, when the handset put a `tel:` URI on the
+            // Person (2026-10-23). Google Messages mostly does not — the
+            // writer's thread index joins a name-only capture to its
+            // provider copy by content instead — but when it does, the join
+            // is a lookup and the thread learns the number at once.
+            // Else (2026-10-26) the number the phone's CONTACTS hold under
+            // the sender's name, on a one-to-one thread: an RCS chat with a
+            // saved contact never reaches the provider store, so without
+            // this a thread titled "Fred Lewis" never learned Fred's number
+            // and its card could offer no ⓘ — nothing to file, nothing to
+            // junk — while the card beside it, headed by a bare number, could.
+            val senderNumber = if (isFromMe) {
+                null
+            } else {
+                telNumber(message.person?.uri)
+                    ?: if (isGroup) null else contactNumberFor(senderName, contactNumbers)
+            }
 
             val dedupKey = buildList {
                 add(sbn.packageName)
@@ -401,6 +426,13 @@ class MessageNotificationListener : NotificationListenerService() {
                 put("conversationTitle", conversationTitle ?: JSONObject.NULL)
                 put("isGroup", isGroup)
                 put("senderName", senderName ?: JSONObject.NULL)
+                put("senderNumber", senderNumber ?: JSONObject.NULL)
+                // Every `tel:` the notification named for the thread — the
+                // sender's, and the people list's. Empty on most RCS threads.
+                put("partyNumbers", org.json.JSONArray(buildList {
+                    senderNumber?.let { add(it) }
+                    for (n in partyNumbers) if (n !in this) add(n)
+                }))
                 put("isFromMe", isFromMe)
                 put("text", text)
                 // The picture or contact card, when there is one. A content URI the shade
@@ -425,6 +457,73 @@ class MessageNotificationListener : NotificationListenerService() {
 
     private fun allowedPackages(): Set<String> =
         IngestConfig(applicationContext).read()?.packages ?: IngestConfig.DEFAULT_PACKAGES
+
+    /**
+     * The numbers the notification named for its people, in the order the
+     * handset listed them: the people list (API 28+) and the older
+     * `EXTRA_PEOPLE` strings, `tel:` URIs only. The member's own Person, when
+     * the style names one with a number, is left out.
+     */
+    private fun partyNumbersOf(
+        notification: Notification,
+        style: NotificationCompat.MessagingStyle,
+    ): List<String> {
+        val out = ArrayList<String>()
+        val self = telNumber(style.user?.uri)
+        fun add(uri: String?) {
+            val n = telNumber(uri) ?: return
+            if (n != self && n !in out) out.add(n)
+        }
+        val extras = notification.extras ?: return out
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            runCatching {
+                @Suppress("DEPRECATION")
+                val people = extras.getParcelableArrayList<android.app.Person>(Notification.EXTRA_PEOPLE_LIST)
+                people?.forEach { add(it.uri) }
+            }
+        }
+        runCatching {
+            @Suppress("DEPRECATION")
+            extras.getStringArray(Notification.EXTRA_PEOPLE)?.forEach { add(it) }
+        }
+        return out
+    }
+
+    /**
+     * The one number the phone's contacts hold under [name], or null: no such
+     * contact, more than one (never guess which "Chris"), no contacts
+     * permission, or a name that is itself a number. [SmsSender.resolveNumber]
+     * is the rule — the same one a reply typed in the app uses to find the
+     * number behind a name-only thread. Cached per notification in [cache].
+     */
+    private fun contactNumberFor(name: String?, cache: HashMap<String, String?>): String? {
+        val n = name?.trim().orEmpty()
+        if (n.isEmpty() || n.startsWith("~") || SmsSender.looksLikeNumber(n)) return null
+        return cache.getOrPut(n) {
+            runCatching { SmsSender(applicationContext).resolveNumber(n) }.getOrNull()
+        }
+    }
+
+    /**
+     * The number in a `tel:` URI, as the handset would dial it (`+` and
+     * digits; separators dropped), or null for anything else — a
+     * `mailto:`, a contacts URI, a short code. Mirrors nothing on the
+     * Dart side: Dart only ever reads the number this produced.
+     */
+    private fun telNumber(uri: String?): String? {
+        val raw = uri?.trim().orEmpty()
+        if (!raw.startsWith("tel:", ignoreCase = true)) return null
+        val decoded = runCatching { android.net.Uri.decode(raw.substring(4)) }.getOrDefault(raw.substring(4))
+        val sb = StringBuilder()
+        for ((i, ch) in decoded.withIndex()) {
+            if (ch.isDigit()) sb.append(ch)
+            else if (ch == '+' && i == 0) sb.append(ch)
+            else if (ch == ' ' || ch == '-' || ch == '(' || ch == ')' || ch == '.') continue
+            else return null
+        }
+        val digits = sb.count { it.isDigit() }
+        return if (digits >= 7) sb.toString() else null
+    }
 
     /**
      * A stable identity for the thread. `shortcutId` is what Google Messages
